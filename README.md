@@ -46,6 +46,26 @@ Planned actions include:
 - `show-runtime-config`
 - `upgrade-loki`
 
+## Testing log ingest/query
+
+Basic smoke test for push + query (run on the unit or via `juju exec`):
+
+```bash
+juju exec --unit loki-vm/0 -- curl -sS http://127.0.0.1:3100/ready
+```
+
+If not ready yet, wait a few seconds and try again. Then push a test log line:
+
+```bash
+juju exec --unit loki-vm/0 -- bash -lc 'ts=$(date +%s%N); payload=$(printf "{\"streams\":[{\"stream\":{\"job\":\"manual-test\",\"app\":\"loki-vm\"},\"values\":[[\"%s\",\"hello from loki-vm test\"]]}]}" "$ts"); curl -sS -H "Content-Type: application/json" -X POST http://127.0.0.1:3100/loki/api/v1/push -d "$payload"'
+```
+
+Query over a time range (last 5 minutes):
+
+```bash
+juju exec --unit loki-vm/0 -- bash -lc 'end=$(date +%s%N); start=$((end-5*60*1000000000)); curl -sS -G http://127.0.0.1:3100/loki/api/v1/query_range --data-urlencode "query={job=\"manual-test\",app=\"loki-vm\"}" --data-urlencode "start=$start" --data-urlencode "end=$end" --data-urlencode "step=1s"'
+```
+
 ## Relations
 
 Planned relations include:

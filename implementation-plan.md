@@ -71,3 +71,15 @@ It is intentionally staged from basic scaffolding to more complex features.
 - [ ] Integration tests for deploy + relations.
 - [x] Update README with usage, config, actions, and relations.
 - [x] Ensure unit tests run without privileged rights; document test commands in `DEVELOPING.md`.
+
+## Phase 8 — Feature parity with loki-k8s (late stage)
+- [ ] Add JujuTopology usage (cosl) and ensure relation metadata uses topology-derived labels.
+- [ ] Align tracing tags with loki-k8s (JAEGER_TAGS based on Juju topology).
+- [ ] Add ruler configuration support and Alertmanager relation integration.
+- [ ] Add Grafana datasource relation support (DatasourceExchange + datasource UID).
+- [ ] Add Grafana dashboards and alert rules packaging (align with k8s charm assets).
+- [ ] Add metrics endpoint exposure (Prometheus scrape relation).
+- [ ] Add TLS certificate integration for HTTP server (certificates relation).
+- [ ] Add tracing integration (tempo coordinator libs) if applicable for VM.
+- [ ] Add catalogue integration and metadata publishing if needed.
+- [ ] Add config migration handling for TSDB schema upgrades (if required).
