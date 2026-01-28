@@ -2,8 +2,8 @@
 
 This file records a stable checkpoint for Phase 0–3 completion.
 
-- Commit: `71e74afaf131b684ef154dc64505dddd139d4e30`
-- Message: checkpoint: phase 0-3 complete
+- Commit: `c1314244dba3f758d6c83d65a608a3a12c736711`
+- Message: docs: update plan and testing guidance
 - Date: 2026-01-28
 
 Notes:
