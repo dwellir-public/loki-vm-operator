@@ -1,35 +1,30 @@
-#!/usr/bin/env python3
-# Copyright 2022 Erik Lönroth
+# Copyright 2026 Erik Lönroth
 # See LICENSE file for licensing details.
+#
+# The integration tests use the Jubilant library. See https://documentation.ubuntu.com/jubilant/
+# To learn more about testing, see https://documentation.ubuntu.com/ops/latest/explanation/testing/
 
-import asyncio
 import logging
-from pathlib import Path
+import pathlib
 
 import pytest
-import yaml
-from pytest_operator.plugin import OpsTest
+ 
+jubilant = pytest.importorskip("jubilant")
 
 logger = logging.getLogger(__name__)
 
-METADATA = yaml.safe_load(Path("./metadata.yaml").read_text())
-APP_NAME = METADATA["name"]
+
+def test_deploy(charm: pathlib.Path, juju: jubilant.Juju):
+    """Deploy the charm under test."""
+    juju.deploy(charm.resolve(), app="loki-vm")
+    juju.wait(jubilant.all_active)
 
 
-@pytest.mark.abort_on_fail
-async def test_build_and_deploy(ops_test: OpsTest):
-    """Build the charm-under-test and deploy it together with related charms.
-
-    Assert on the unit status before any relations/configurations take place.
-    """
-    # Build and deploy charm from local source folder
-    charm = await ops_test.build_charm(".")
-    resources = {"httpbin-image": METADATA["resources"]["httpbin-image"]["upstream-source"]}
-
-    # Deploy the charm and wait for active/idle status
-    await asyncio.gather(
-        ops_test.model.deploy(await charm, resources=resources, application_name=APP_NAME),
-        ops_test.model.wait_for_idle(
-            apps=[APP_NAME], status="active", raise_on_blocked=True, timeout=1000
-        ),
-    )
+# If you implement loki.get_version in the charm source,
+# remove the @pytest.mark.skip line to enable this test.
+# Alternatively, remove this test if you don't need it.
+@pytest.mark.skip(reason="loki.get_version is not implemented")
+def test_workload_version_is_set(charm: pathlib.Path, juju: jubilant.Juju):
+    """Check that the correct version of the workload is running."""
+    version = juju.status().apps["loki-vm"].version
+    assert version == "3.14"  # Replace 3.14 by the expected version of the workload.

@@ -1,75 +1,248 @@
-# Copyright 2022 Erik Lönroth
+# Copyright 2026 Erik Lönroth
 # See LICENSE file for licensing details.
 #
-# Learn more about testing at: https://juju.is/docs/sdk/testing
+# To learn more about testing, see https://documentation.ubuntu.com/ops/latest/explanation/testing/
 
-import unittest
+import pytest
+import yaml
+from ops import testing
 
-import ops.testing
-from ops.model import ActiveStatus, BlockedStatus, WaitingStatus
-from ops.testing import Harness
-
-from charm import LokiCharm
+from charm import LokiVmCharm
 
 
-class TestCharm(unittest.TestCase):
-    def setUp(self):
-        # Enable more accurate simulation of container networking.
-        # For more information, see https://juju.is/docs/sdk/testing#heading--simulate-can-connect
-        ops.testing.SIMULATE_CAN_CONNECT = True
-        self.addCleanup(setattr, ops.testing, "SIMULATE_CAN_CONNECT", False)
+META = {
+    "name": "loki-vm",
+    "provides": {"loki_push_api": {"interface": "loki_push_api"}},
+    "requires": {"ingress": {"interface": "ingress_per_unit"}},
+    "peers": {"replicas": {"interface": "loki_replica"}},
+    "storage": {"loki-persisted": {"type": "filesystem"}},
+}
 
-        self.harness = Harness(LokiCharm)
-        self.addCleanup(self.harness.cleanup)
-        self.harness.begin()
+CONFIG_SPEC = {
+    "options": {
+        "ingestion-rate-mb": {"type": "int", "default": 4},
+        "ingestion-burst-size-mb": {"type": "int", "default": 15},
+        "retention-period": {"type": "int", "default": 0},
+        "reporting-enabled": {"type": "boolean", "default": True},
+        "external-url": {"type": "string", "default": ""},
+        "config-override": {"type": "string", "default": ""},
+    }
+}
 
-    def test_httpbin_pebble_ready(self):
-        # Expected plan after Pebble ready with default config
-        expected_plan = {
-            "services": {
-                "httpbin": {
-                    "override": "replace",
-                    "summary": "httpbin",
-                    "command": "gunicorn -b 0.0.0.0:80 httpbin:app -k gevent",
-                    "startup": "enabled",
-                    "environment": {"GUNICORN_CMD_ARGS": "--log-level info"},
-                }
-            },
-        }
-        # Simulate the container coming up and emission of pebble-ready event
-        self.harness.container_pebble_ready("httpbin")
-        # Get the plan now we've run PebbleReady
-        updated_plan = self.harness.get_container_pebble_plan("httpbin").to_dict()
-        # Check we've got the plan we expected
-        self.assertEqual(expected_plan, updated_plan)
-        # Check the service was started
-        service = self.harness.model.unit.get_container("httpbin").get_service("httpbin")
-        self.assertTrue(service.is_running())
-        # Ensure we set an ActiveStatus with no message
-        self.assertEqual(self.harness.model.unit.status, ActiveStatus())
 
-    def test_config_changed_valid_can_connect(self):
-        # Ensure the simulated Pebble API is reachable
-        self.harness.set_can_connect("httpbin", True)
-        # Trigger a config-changed event with an updated value
-        self.harness.update_config({"log-level": "debug"})
-        # Get the plan now we've run PebbleReady
-        updated_plan = self.harness.get_container_pebble_plan("httpbin").to_dict()
-        updated_env = updated_plan["services"]["httpbin"]["environment"]
-        # Check the config change was effective
-        self.assertEqual(updated_env, {"GUNICORN_CMD_ARGS": "--log-level debug"})
-        self.assertEqual(self.harness.model.unit.status, ActiveStatus())
+def _context() -> testing.Context:
+    return testing.Context(LokiVmCharm, meta=META, config=CONFIG_SPEC)
 
-    def test_config_changed_valid_cannot_connect(self):
-        # Trigger a config-changed event with an updated value
-        self.harness.update_config({"log-level": "debug"})
-        # Check the charm is in WaitingStatus
-        self.assertIsInstance(self.harness.model.unit.status, WaitingStatus)
 
-    def test_config_changed_invalid(self):
-        # Ensure the simulated Pebble API is reachable
-        self.harness.set_can_connect("httpbin", True)
-        # Trigger a config-changed event with an updated value
-        self.harness.update_config({"log-level": "foobar"})
-        # Check the charm is in BlockedStatus
-        self.assertIsInstance(self.harness.model.unit.status, BlockedStatus)
+def mock_get_version():
+    """Get a mock version string without executing the workload code."""
+    return "1.0.0"
+
+
+def test_start(monkeypatch: pytest.MonkeyPatch):
+    """Verify start sets workload version and Active status."""
+    # Arrange:
+    ctx = _context()
+    monkeypatch.setattr("charm.loki.get_version", mock_get_version)
+    monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
+    monkeypatch.setattr("charm.loki.start", lambda: None)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    # Act:
+    state_out = ctx.run(ctx.on.start(), testing.State())
+    # Assert:
+    assert state_out.workload_version is not None
+    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+
+def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
+    """Ensure config-override bypasses generated config rendering."""
+    ctx = _context()
+    seen = {}
+
+    def mock_write_config_text(config_text: str, **_):
+        seen["config"] = config_text
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "auth_enabled: false\nserver:\n  http_listen_port: 3100\n",
+    }
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
+
+    assert "auth_enabled: false" in seen["config"]
+    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+
+
+def test_invalid_config_keeps_last_good(monkeypatch: pytest.MonkeyPatch):
+    """Keep last-good config when validation fails on a new config."""
+    ctx = _context()
+    writes = []
+
+    def mock_write_config_text(config_text: str, **_):
+        writes.append(config_text)
+
+    def verify_ok(**_):
+        return None
+
+    def verify_fail(**_):
+        raise RuntimeError("invalid config")
+
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+
+    good_config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "",
+    }
+
+    monkeypatch.setattr("charm.loki.verify_config", verify_ok)
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(config=good_config))
+    assert len(writes) == 1
+    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+    bad_config = {
+        **good_config,
+        "config-override": "not: [valid",
+    }
+
+    monkeypatch.setattr("charm.loki.verify_config", verify_fail)
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(config=bad_config))
+
+    assert len(writes) == 1
+    assert isinstance(state_out.unit_status, testing.WaitingStatus)
+
+
+def test_config_drift_sets_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Detect on-disk config drift and switch to Maintenance status."""
+    ctx = _context()
+    config_path = tmp_path / "config.yml"
+    monkeypatch.setattr("charm.DEFAULT_CONFIG_PATH", str(config_path))
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+
+    def write_config_text(config_text: str, **_):
+        config_path.write_text(config_text, encoding="utf-8")
+
+    monkeypatch.setattr("charm.loki.write_config_text", write_config_text)
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "auth_enabled: false\n",
+    }
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
+    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+    config_path.write_text("manual: true\n", encoding="utf-8")
+    state_out = ctx.run(ctx.on.update_status(), state_out)
+
+    assert isinstance(state_out.unit_status, testing.MaintenanceStatus)
+
+
+def test_replicas_relation_updates_memberlist_config(monkeypatch: pytest.MonkeyPatch):
+    """Render memberlist config when peer relation provides join members."""
+    ctx = _context()
+    seen = {}
+
+    def mock_write_config_text(config_text: str, **_):
+        seen["config"] = config_text
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        peers_data={1: {"address": "10.0.0.2"}},
+    )
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "",
+    }
+
+    state = testing.State(config=config, relations=[relation])
+    with ctx(ctx.on.update_status(), state) as manager:
+        manager.charm._configure()
+
+    rendered = "\n".join(
+        line for line in seen["config"].splitlines() if not line.startswith("#")
+    )
+    config_yaml = yaml.safe_load(rendered)
+    assert config_yaml["common"]["ring"]["kvstore"]["store"] == "memberlist"
+    assert config_yaml["memberlist"]["join_members"] == ["10.0.0.2"]
+
+
+def test_external_url_updates_push_endpoint(monkeypatch: pytest.MonkeyPatch):
+    """Normalize external-url and publish it via LokiPushApiProvider."""
+    ctx = _context()
+    captured = {}
+
+    def mock_update_endpoint(self, url: str = "", relation=None):
+        captured["url"] = url
+
+    monkeypatch.setattr("charm.LokiPushApiProvider.update_endpoint", mock_update_endpoint)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr("charm.LokiVmCharm._is_leader", lambda *_: True)
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "logs.example.com",
+        "config-override": "",
+    }
+
+    ctx.run(ctx.on.config_changed(), testing.State(config=config))
+
+    assert captured["url"] == "http://logs.example.com:3100"
+
+
+def test_external_url_non_leader_clears_endpoint(monkeypatch: pytest.MonkeyPatch):
+    """Ensure non-leaders clear their loki_push_api endpoint when external-url is set."""
+    ctx = _context()
+    relation = testing.Relation(
+        endpoint="loki_push_api",
+        interface="loki_push_api",
+        local_unit_data={"endpoint": "stale"},
+    )
+
+    monkeypatch.setattr("charm.LokiVmCharm._is_leader", lambda *_: False)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "logs.example.com",
+        "config-override": "",
+    }
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(config=config, relations=[relation]),
+    )
+
+    relation_out = next(iter(state_out.relations))
+    assert relation_out.local_unit_data.get("endpoint") is None
