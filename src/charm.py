@@ -37,11 +37,13 @@ class LokiVmCharm(ops.CharmBase):
             data_dir=DEFAULT_DATA_DIR,
             last_good_config="",
             last_failed_config_path="",
+            config_drifted=False,
         )
         framework.observe(self.on.install, self._on_install)
         framework.observe(self.on.start, self._on_start)
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
+        framework.observe(self.on.update_status, self._on_update_status)
         framework.observe(
             self.on.loki_persisted_storage_attached, self._on_loki_persisted_storage_attached
         )
@@ -85,6 +87,10 @@ class LokiVmCharm(ops.CharmBase):
     def _on_upgrade_charm(self, event: ops.UpgradeCharmEvent) -> None:
         """Handle charm upgrade without restarting or rewriting configuration."""
         logger.info("Upgrade-charm event: skipping config rewrite and restart.")
+
+    def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
+        """Handle periodic status updates (detect config drift)."""
+        self._reconcile_config_drift_status()
 
     def _on_loki_persisted_storage_attached(self, event: ops.StorageAttachedEvent) -> None:
         """Handle loki-persisted storage attachment."""
@@ -134,6 +140,9 @@ class LokiVmCharm(ops.CharmBase):
         )
         # Store the last good config
         self._stored.last_good_config = config_text
+        if self._stored.config_drifted:
+            logger.info("Loki config drift resolved by applying charm configuration.")
+        self._stored.config_drifted = False
         return True
 
     def _persist_failed_config(self, config_text: str) -> Path | None:
@@ -196,6 +205,53 @@ class LokiVmCharm(ops.CharmBase):
             if tmp_path and tmp_path.exists():
                 tmp_path.unlink()
         return True
+
+    def _reconcile_config_drift_status(self) -> None:
+        """Detect config drift and update unit status if appropriate."""
+        drifted = self._has_config_drift()
+        if drifted != self._stored.config_drifted:
+            if drifted:
+                logger.warning(
+                    "Detected manual Loki config change at %s", DEFAULT_CONFIG_PATH
+                )
+            else:
+                logger.info("Loki config drift cleared.")
+        self._stored.config_drifted = drifted
+        if drifted:
+            if isinstance(self.unit.status, (ops.ActiveStatus, ops.MaintenanceStatus)):
+                self.unit.status = ops.MaintenanceStatus(self._config_drift_message())
+            return
+        if self._is_drift_status():
+            self.unit.status = ops.ActiveStatus()
+
+    def _has_config_drift(self) -> bool:
+        """Return True when on-disk config differs from the last good config."""
+        if not self._stored.last_good_config:
+            return False
+        on_disk = self._read_config_from_disk()
+        if on_disk is None:
+            return True
+        return on_disk != self._stored.last_good_config
+
+    def _read_config_from_disk(self) -> str | None:
+        """Read the on-disk config text, returning None if unreadable."""
+        path = Path(DEFAULT_CONFIG_PATH)
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            logger.warning("Failed to read Loki config from disk: %s", exc)
+            return None
+
+    def _config_drift_message(self) -> str:
+        return f"Manual Loki config change detected at {DEFAULT_CONFIG_PATH}"
+
+    def _is_drift_status(self) -> bool:
+        return (
+            isinstance(self.unit.status, ops.MaintenanceStatus)
+            and self.unit.status.message == self._config_drift_message()
+        )
 
     def _instance_addr(self) -> str:
         """Return the best-available address for the Loki ring."""

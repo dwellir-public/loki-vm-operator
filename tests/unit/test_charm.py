@@ -94,3 +94,31 @@ def test_invalid_config_keeps_last_good(monkeypatch: pytest.MonkeyPatch):
 
     assert len(writes) == 1
     assert isinstance(state_out.unit_status, testing.WaitingStatus)
+
+
+def test_config_drift_sets_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    ctx = testing.Context(LokiVmCharm)
+    config_path = tmp_path / "config.yml"
+    monkeypatch.setattr("charm.DEFAULT_CONFIG_PATH", str(config_path))
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+
+    def write_config_text(config_text: str, **_):
+        config_path.write_text(config_text, encoding="utf-8")
+
+    monkeypatch.setattr("charm.loki.write_config_text", write_config_text)
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "auth_enabled: false\n",
+    }
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
+    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+    config_path.write_text("manual: true\n", encoding="utf-8")
+    state_out = ctx.run(ctx.on.update_status(), state_out)
+
+    assert isinstance(state_out.unit_status, testing.MaintenanceStatus)
