@@ -47,6 +47,7 @@ class ConfigBuilder:
         alertmanager_url: Optional[str] = None,
         grafana_external_url: Optional[str] = None,
         datasource_uid: Optional[str] = None,
+        memberlist_join_members: Optional[List[str]] = None,
     ):
         """Init method."""
         self.instance_addr = instance_addr
@@ -59,6 +60,7 @@ class ConfigBuilder:
         self.alertmanager_url = alertmanager_url
         self.grafana_external_url = grafana_external_url
         self.datasource_uid = datasource_uid
+        self.memberlist_join_members = memberlist_join_members
 
         self.data_dir = data_dir
         self.chunks_dir = os.path.join(self.data_dir, "chunks")
@@ -85,6 +87,9 @@ class ConfigBuilder:
             "compactor": self._compactor,
         }
 
+        if memberlist := self._memberlist:
+            loki_config["memberlist"] = memberlist
+
         if ruler_config := self._ruler:
             loki_config["ruler"] = ruler_config
 
@@ -96,10 +101,13 @@ class ConfigBuilder:
 
     @property
     def _common(self) -> dict:
+        kvstore = {"store": "inmemory"}
+        if self.memberlist_join_members is not None:
+            kvstore = {"store": "memberlist"}
         return {
             "path_prefix": self.data_dir,
             "replication_factor": 1,
-            "ring": {"instance_addr": self.instance_addr, "kvstore": {"store": "inmemory"}},
+            "ring": {"instance_addr": self.instance_addr, "kvstore": kvstore},
             "storage": {
                 "filesystem": {
                     "chunks_directory": self.chunks_dir,
@@ -249,3 +257,12 @@ class ConfigBuilder:
         return {
             "reporting_enabled": self.reporting_enabled,
         }
+
+    @property
+    def _memberlist(self) -> Optional[dict]:
+        if self.memberlist_join_members is None:
+            return None
+        config = {}
+        if self.memberlist_join_members:
+            config["join_members"] = self.memberlist_join_members
+        return config

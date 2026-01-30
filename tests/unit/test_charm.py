@@ -4,9 +4,34 @@
 # To learn more about testing, see https://documentation.ubuntu.com/ops/latest/explanation/testing/
 
 import pytest
+import yaml
 from ops import testing
 
 from charm import LokiVmCharm
+
+
+META = {
+    "name": "loki-vm",
+    "provides": {"loki_push_api": {"interface": "loki_push_api"}},
+    "requires": {"ingress": {"interface": "ingress_per_unit"}},
+    "peers": {"replicas": {"interface": "loki_replica"}},
+    "storage": {"loki-persisted": {"type": "filesystem"}},
+}
+
+CONFIG_SPEC = {
+    "options": {
+        "ingestion-rate-mb": {"type": "int", "default": 4},
+        "ingestion-burst-size-mb": {"type": "int", "default": 15},
+        "retention-period": {"type": "int", "default": 0},
+        "reporting-enabled": {"type": "boolean", "default": True},
+        "external-url": {"type": "string", "default": ""},
+        "config-override": {"type": "string", "default": ""},
+    }
+}
+
+
+def _context() -> testing.Context:
+    return testing.Context(LokiVmCharm, meta=META, config=CONFIG_SPEC)
 
 
 def mock_get_version():
@@ -15,9 +40,9 @@ def mock_get_version():
 
 
 def test_start(monkeypatch: pytest.MonkeyPatch):
-    """Test that the charm has the correct state after handling the start event."""
+    """Verify start sets workload version and Active status."""
     # Arrange:
-    ctx = testing.Context(LokiVmCharm)
+    ctx = _context()
     monkeypatch.setattr("charm.loki.get_version", mock_get_version)
     monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
     monkeypatch.setattr("charm.loki.start", lambda: None)
@@ -31,7 +56,8 @@ def test_start(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
-    ctx = testing.Context(LokiVmCharm)
+    """Ensure config-override bypasses generated config rendering."""
+    ctx = _context()
     seen = {}
 
     def mock_write_config_text(config_text: str, **_):
@@ -56,7 +82,8 @@ def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_invalid_config_keeps_last_good(monkeypatch: pytest.MonkeyPatch):
-    ctx = testing.Context(LokiVmCharm)
+    """Keep last-good config when validation fails on a new config."""
+    ctx = _context()
     writes = []
 
     def mock_write_config_text(config_text: str, **_):
@@ -97,7 +124,8 @@ def test_invalid_config_keeps_last_good(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_config_drift_sets_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path):
-    ctx = testing.Context(LokiVmCharm)
+    """Detect on-disk config drift and switch to Maintenance status."""
+    ctx = _context()
     config_path = tmp_path / "config.yml"
     monkeypatch.setattr("charm.DEFAULT_CONFIG_PATH", str(config_path))
     monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
@@ -122,3 +150,99 @@ def test_config_drift_sets_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path
     state_out = ctx.run(ctx.on.update_status(), state_out)
 
     assert isinstance(state_out.unit_status, testing.MaintenanceStatus)
+
+
+def test_replicas_relation_updates_memberlist_config(monkeypatch: pytest.MonkeyPatch):
+    """Render memberlist config when peer relation provides join members."""
+    ctx = _context()
+    seen = {}
+
+    def mock_write_config_text(config_text: str, **_):
+        seen["config"] = config_text
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        peers_data={1: {"address": "10.0.0.2"}},
+    )
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "",
+    }
+
+    state = testing.State(config=config, relations=[relation])
+    with ctx(ctx.on.update_status(), state) as manager:
+        manager.charm._configure()
+
+    rendered = "\n".join(
+        line for line in seen["config"].splitlines() if not line.startswith("#")
+    )
+    config_yaml = yaml.safe_load(rendered)
+    assert config_yaml["common"]["ring"]["kvstore"]["store"] == "memberlist"
+    assert config_yaml["memberlist"]["join_members"] == ["10.0.0.2"]
+
+
+def test_external_url_updates_push_endpoint(monkeypatch: pytest.MonkeyPatch):
+    """Normalize external-url and publish it via LokiPushApiProvider."""
+    ctx = _context()
+    captured = {}
+
+    def mock_update_endpoint(self, url: str = "", relation=None):
+        captured["url"] = url
+
+    monkeypatch.setattr("charm.LokiPushApiProvider.update_endpoint", mock_update_endpoint)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr("charm.LokiVmCharm._is_leader", lambda *_: True)
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "logs.example.com",
+        "config-override": "",
+    }
+
+    ctx.run(ctx.on.config_changed(), testing.State(config=config))
+
+    assert captured["url"] == "http://logs.example.com:3100"
+
+
+def test_external_url_non_leader_clears_endpoint(monkeypatch: pytest.MonkeyPatch):
+    """Ensure non-leaders clear their loki_push_api endpoint when external-url is set."""
+    ctx = _context()
+    relation = testing.Relation(
+        endpoint="loki_push_api",
+        interface="loki_push_api",
+        local_unit_data={"endpoint": "stale"},
+    )
+
+    monkeypatch.setattr("charm.LokiVmCharm._is_leader", lambda *_: False)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "logs.example.com",
+        "config-override": "",
+    }
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(config=config, relations=[relation]),
+    )
+
+    relation_out = next(iter(state_out.relations))
+    assert relation_out.local_unit_data.get("endpoint") is None

@@ -9,12 +9,15 @@ from __future__ import annotations
 import logging
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import ops
 import yaml
 
 # A standalone module for workload-specific logic (no charming concerns):
 import loki
+from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
+from charms.traefik_k8s.v1.ingress_per_unit import IngressPerUnitRequirer
 from config_builder import (
     DEFAULT_CONFIG_BACKUP_PATH,
     DEFAULT_CONFIG_PATH,
@@ -32,6 +35,7 @@ class LokiVmCharm(ops.CharmBase):
     _stored = ops.StoredState()
 
     def __init__(self, framework: ops.Framework):
+        """Initialize the charm, relations, and event observers."""
         super().__init__(framework)
         self._stored.set_default(
             data_dir=DEFAULT_DATA_DIR,
@@ -39,23 +43,39 @@ class LokiVmCharm(ops.CharmBase):
             last_failed_config_path="",
             config_drifted=False,
         )
+        self.ingress = IngressPerUnitRequirer(
+            self,
+            relation_name="ingress",
+            port=3100,
+            scheme=lambda: "http",
+            strip_prefix=True,
+        )
+        self.loki_provider = LokiPushApiProvider(
+            self,
+            relation_name="loki_push_api",
+            port=3100,
+            scheme="http",
+            path="loki/api/v1/push",
+        )
         framework.observe(self.on.install, self._on_install)
         framework.observe(self.on.start, self._on_start)
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
         framework.observe(self.on.update_status, self._on_update_status)
+        framework.observe(self.ingress.on.ready_for_unit, self._on_ingress_changed)
+        framework.observe(self.ingress.on.revoked_for_unit, self._on_ingress_changed)
         framework.observe(
             self.on.loki_persisted_storage_attached, self._on_loki_persisted_storage_attached
         )
         framework.observe(
             self.on.loki_persisted_storage_detaching, self._on_loki_persisted_storage_detaching
         )
+        framework.observe(self.on.replicas_relation_joined, self._on_replicas_changed)
+        framework.observe(self.on.replicas_relation_changed, self._on_replicas_changed)
+        framework.observe(self.on.replicas_relation_departed, self._on_replicas_changed)
 
     def _on_install(self, event: ops.InstallEvent):
-        """
-        Install the workload on the machine. 
-        Preserve the default config file.
-        """
+        """Install the workload and preserve the package default config."""
         loki.install()
         loki.preserve_default_config(
             config_path=Path(DEFAULT_CONFIG_PATH),
@@ -63,7 +83,7 @@ class LokiVmCharm(ops.CharmBase):
         )
 
     def _on_start(self, event: ops.StartEvent):
-        """Handle start event."""
+        """Start Loki, apply config, and set workload/version status."""
         self.unit.status = ops.MaintenanceStatus("starting workload")
         loki.ensure_data_dir(self.data_dir)
         config_ok = self._configure()
@@ -71,14 +91,16 @@ class LokiVmCharm(ops.CharmBase):
         version = loki.get_version()
         if version is not None:
             self.unit.set_workload_version(version)
+        self._refresh_loki_provider_endpoint()
         if config_ok:
             self.unit.status = ops.ActiveStatus()
         else:
             self.unit.status = self._invalid_config_status()
 
     def _on_config_changed(self, event: ops.ConfigChangedEvent) -> None:
-        """Handle config changes."""
+        """Re-render and apply configuration when charm config changes."""
         self.unit.status = ops.MaintenanceStatus("configuring Loki")
+        self._refresh_loki_provider_endpoint()
         if self._configure():
             self.unit.status = ops.ActiveStatus("Loki configuration updated and validated.")
         else:
@@ -89,11 +111,30 @@ class LokiVmCharm(ops.CharmBase):
         logger.info("Upgrade-charm event: skipping config rewrite and restart.")
 
     def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
-        """Handle periodic status updates (detect config drift)."""
+        """Handle periodic status updates (detect drift and workload health)."""
+        if not loki.is_active():
+            self.unit.status = ops.MaintenanceStatus("Loki service not running")
+            return
         self._reconcile_config_drift_status()
+        if self._is_service_down_status() and not self._stored.config_drifted:
+            self.unit.status = ops.ActiveStatus()
+
+    def _on_ingress_changed(self, event: ops.EventBase) -> None:
+        """Handle ingress updates by refreshing the published endpoint."""
+        self._refresh_loki_provider_endpoint()
+
+    def _on_replicas_changed(self, event: ops.RelationEvent) -> None:
+        """Handle peer relation changes and reconfigure memberlist joins."""
+        if event.relation:
+            event.relation.data[self.unit]["address"] = self._instance_addr()
+        self.unit.status = ops.MaintenanceStatus("updating cluster configuration")
+        if self._configure():
+            self.unit.status = ops.ActiveStatus("Loki configuration updated and validated.")
+        else:
+            self.unit.status = self._invalid_config_status()
 
     def _on_loki_persisted_storage_attached(self, event: ops.StorageAttachedEvent) -> None:
-        """Handle loki-persisted storage attachment."""
+        """Update data dir when loki-persisted storage is attached."""
         storage_path = event.storage.location
         if storage_path is None:
             logger.warning("loki-persisted storage attached without a location")
@@ -103,7 +144,7 @@ class LokiVmCharm(ops.CharmBase):
         loki.ensure_data_dir(self._stored.data_dir)
 
     def _on_loki_persisted_storage_detaching(self, event: ops.StorageDetachingEvent) -> None:
-        """Handle loki-persisted storage detaching."""
+        """Restore default data dir when loki-persisted storage detaches."""
         self._stored.data_dir = DEFAULT_DATA_DIR
         logger.warning("loki-persisted storage detaching; data dir will be reset to %s", self._stored.data_dir)
         loki.ensure_data_dir(self._stored.data_dir)
@@ -114,12 +155,15 @@ class LokiVmCharm(ops.CharmBase):
         return str(self._stored.data_dir)
 
     def _configure(self) -> bool:
-        """
-        * Ensure data dir permissions are set.
-        * Render config
-        * Validate and persist Loki configuration to DEFAULT_CONFIG_PATH.
-        * Store the last good config in _stored.last_good_config.
-        * Logs invalid config status if validation fails.
+        """Render, validate, and persist Loki configuration.
+
+        Flow:
+        - Ensure Loki can write to the data directory.
+        - Render config from `config-override` or ConfigBuilder output.
+        - Verify config with `loki -verify-config` on a temp file.
+        - If invalid, keep the last-good config and record the failed config path.
+        - If valid, write the config + backup and update last-good config state.
+        - Clear drift status after a successful apply.
         """
         loki.ensure_data_dir_permissions(self.data_dir)
         config_text = self._render_config_text()
@@ -186,6 +230,7 @@ class LokiVmCharm(ops.CharmBase):
             retention_period=int(self.config["retention-period"]),
             reporting_enabled=bool(self.config["reporting-enabled"]),
             data_dir=self.data_dir,
+            memberlist_join_members=self._memberlist_join_members(),
         )
         rendered = yaml.safe_dump(builder.build(), sort_keys=False)
         return f"{loki.GENERATED_CONFIG_HEADER}{rendered}"
@@ -245,21 +290,96 @@ class LokiVmCharm(ops.CharmBase):
             return None
 
     def _config_drift_message(self) -> str:
+        """Return the Maintenance status message for config drift."""
         return f"Manual Loki config change detected at {DEFAULT_CONFIG_PATH}"
 
     def _is_drift_status(self) -> bool:
+        """Return True if the unit is in the drift Maintenance status."""
         return (
             isinstance(self.unit.status, ops.MaintenanceStatus)
             and self.unit.status.message == self._config_drift_message()
         )
 
+    def _is_service_down_status(self) -> bool:
+        """Return True if the unit is in the service-not-running status."""
+        return (
+            isinstance(self.unit.status, ops.MaintenanceStatus)
+            and self.unit.status.message == "Loki service not running"
+        )
+
     def _instance_addr(self) -> str:
-        """Return the best-available address for the Loki ring."""
+        """Return the best-available address for the Loki ring and endpoints."""
         if getattr(self.unit, "private_address", None):
             return str(self.unit.private_address)
         if getattr(self.unit, "public_address", None):
             return str(self.unit.public_address)
+        if getattr(self.unit, "address", None):
+            return str(self.unit.address)
+        for endpoint in ("replicas", "loki_push_api", "ingress"):
+            binding = self.model.get_binding(endpoint)
+            if binding and binding.network.bind_address:
+                return str(binding.network.bind_address)
+            if binding and binding.network.ingress_address:
+                return str(binding.network.ingress_address)
         return "127.0.0.1"
+
+    def _memberlist_join_members(self) -> list[str] | None:
+        """Return join member addresses from the replicas relation."""
+        relation = self.model.get_relation("replicas")
+        if relation is None:
+            return None
+        members = []
+        for unit in relation.units:
+            addr = relation.data[unit].get("address")
+            if addr and addr != self._instance_addr():
+                members.append(addr)
+        return members
+
+    def _refresh_loki_provider_endpoint(self) -> None:
+        """Publish Loki push API endpoint to relation data."""
+        if self._external_url_configured() and not self._is_leader():
+            self._clear_loki_provider_endpoint()
+            return
+        url = self._external_url_base()
+        if url:
+            self.loki_provider.update_endpoint(url=url)
+
+    def _external_url_base(self) -> str:
+        """Return base URL (scheme://host:port[/path]) for Loki ingress."""
+        external = str(self.config.get("external-url", "")).strip()
+        if external:
+            return self._normalize_external_url(external)
+        if ingress_url := self._ingress_url():
+            return ingress_url.rstrip("/")
+        addr = self._instance_addr()
+        return f"http://{addr}:3100"
+
+    def _external_url_configured(self) -> bool:
+        """Return True when external-url is set."""
+        return bool(str(self.config.get("external-url", "")).strip())
+
+    def _is_leader(self) -> bool:
+        """Return True when this unit is the leader."""
+        return self.unit.is_leader()
+
+    def _clear_loki_provider_endpoint(self) -> None:
+        """Clear the published endpoint on this unit's relation data."""
+        for relation in self.model.relations.get("loki_push_api", []):
+            relation.data[self.unit].pop("endpoint", None)
+
+    def _normalize_external_url(self, url: str) -> str:
+        """Normalize external-url into a scheme://host:port[/path] base URL."""
+        parsed = urlparse(url if "://" in url else f"http://{url}")
+        scheme = parsed.scheme or "http"
+        netloc = parsed.netloc or parsed.path
+        path = parsed.path if parsed.netloc else ""
+        if ":" not in netloc:
+            netloc = f"{netloc}:3100"
+        return f"{scheme}://{netloc}{path}".rstrip("/")
+
+    def _ingress_url(self) -> str | None:
+        """Return the ingress URL for this unit when available."""
+        return self.ingress.url if self.ingress else None
 
 
 if __name__ == "__main__":  # pragma: nocover

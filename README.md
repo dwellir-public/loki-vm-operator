@@ -68,10 +68,92 @@ juju exec --unit loki-vm/0 -- bash -lc 'end=$(date +%s%N); start=$((end-5*60*100
 
 ## Relations
 
-Planned relations include:
-- `peers` (replicas)
-- `ingress`
-- `loki_push_api`
+Supported relations:
+- `replicas` (peers) for clustering
+- `ingress` (ingress_per_unit)
+- `loki_push_api` (provides Loki push endpoint)
+
+## 3-node cluster behavior
+
+When deployed with three units, `loki-vm` forms a memberlist cluster. Each unit
+advertises its address to peers and the ring uses `memberlist.join_members` to
+discover the other units. This assumes a shared backend storage (S3/MinIO) if you
+intend to ingest to multiple units.
+
+### Ingestion endpoint publishing
+
+The charm publishes a Loki push API endpoint via the `loki_push_api` relation.
+Behavior depends on whether `external-url` is set:
+
+- **`external-url` set (recommended for clusters):**
+  - Only the **leader** unit publishes the endpoint.
+  - The published endpoint is exactly the `external-url` base with
+    `/loki/api/v1/push` appended.
+  - Use this when you have a load balancer, ingress, or proxy in front of the
+    Loki cluster.
+
+- **`external-url` unset:**
+  - Each unit publishes its own unit address.
+  - Clients (e.g., Alloy) will fan‑out writes to all endpoints, which can
+    duplicate logs unless you are intentionally doing multi‑write.
+
+## External URL configuration (details)
+
+`external-url` controls the base address advertised to clients. It should be a
+scheme + host + optional port (no `/loki/api/v1/push` suffix).
+
+Example with a load balancer:
+
+```bash
+juju config loki-vm external-url="https://logs.example.com"
+```
+
+Example with a direct unit address:
+
+```bash
+juju config loki-vm external-url="http://10.0.0.10:3100"
+```
+
+The charm appends `/loki/api/v1/push` internally when publishing relation data.
+
+## Cross-model logging (single unit)
+
+To allow a client charm in another model to push logs to a single-unit Loki VM,
+offer the `loki_push_api` relation from the Loki model and consume it in the
+client model.
+
+On the Loki model (where `loki-vm/0` is deployed):
+
+```bash
+juju offer loki-vm:loki_push_api
+```
+
+On the client model:
+
+```bash
+juju consume <controller>:<loki-model>.loki-vm
+juju relate <client-app>:logging loki-vm:loki_push_api
+```
+
+If the client expects a different relation name, adjust the left-hand side
+accordingly.
+
+`external-url` controls the base address advertised to clients. It should be a
+scheme + host + optional port (no `/loki/api/v1/push` suffix), for example:
+
+```bash
+juju config loki-vm external-url="http://10.0.0.10:3100"
+```
+
+If you are using ingress or a proxy, set `external-url` to the externally
+reachable base URL instead, for example:
+
+```bash
+juju config loki-vm external-url="https://logs.example.com"
+```
+
+The charm will append `/loki/api/v1/push` internally when publishing the
+relation endpoint.
 
 ## Other resources
 

@@ -43,6 +43,7 @@ GRAFANA_GPG_KEY_URL = "https://apt.grafana.com/gpg.key"
 
 DEFAULT_VERIFY_TIMEOUT = 30
 DEFAULT_START_TIMEOUT = 60
+DEFAULT_STATUS_TIMEOUT = 10
 
 
 def _run(cmd: Iterable[str], *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
@@ -313,6 +314,15 @@ def verify_config(
         ],
         timeout=timeout,
     )
+
+
+def is_active(*, timeout: int = DEFAULT_STATUS_TIMEOUT) -> bool:
+    """Return True if the Loki systemd service is active."""
+    try:
+        _run(["systemctl", "is-active", "--quiet", "loki"], timeout=timeout)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
 
 
 def _write_file_atomic(path: Path, content: str) -> None:

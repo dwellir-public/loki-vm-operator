@@ -74,10 +74,10 @@ CHARM_PATH=/path/to/loki-vm_ubuntu-24.04-amd64.charm uv run pytest tests/integra
 Note: Rebuild the charm (`charmcraft pack`) after code changes so integration tests
 use the latest artifact.
 
-If you run pytest without uv, make sure `ops` is installed and `PYTHONPATH` includes `src`:
+If you run pytest without uv, make sure `ops` is installed and `PYTHONPATH` includes `src` and `lib`:
 
 ```bash
-PYTHONPATH=src pytest tests/unit
+PYTHONPATH=src:lib pytest tests/unit
 ```
 
 Note: integration tests are skipped automatically if `jubilant` is not installed.
