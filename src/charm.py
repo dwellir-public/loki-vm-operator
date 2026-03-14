@@ -165,7 +165,11 @@ class LokiVmCharm(ops.CharmBase):
         self._refresh_grafana_source_endpoint()
 
     def _on_grafana_source_changed(self, event: ops.EventBase) -> None:
-        """Handle Grafana source relation changes and update datasource exchange."""
+        """Re-publish datasource-exchange payload when Grafana-source data changes.
+
+        This keeps the `send-datasource` relation in sync with datasource UIDs
+        assigned by related Grafana applications.
+        """
         self._update_datasource_exchange()
 
     def _on_replicas_changed(self, event: ops.RelationEvent) -> None:
@@ -396,7 +400,12 @@ class LokiVmCharm(ops.CharmBase):
             self.loki_provider.update_endpoint(url=url)
 
     def _refresh_grafana_source_endpoint(self) -> None:
-        """Publish Grafana datasource endpoint to relation data."""
+        """Refresh the endpoint published on `grafana-source` relations.
+
+        Leaders publish the effective Loki URL. Non-leaders clear stale unit
+        data when `external-url` is configured, mirroring the `loki_push_api`
+        publication behavior.
+        """
         if self._external_url_configured() and not self._is_leader():
             self._clear_grafana_source_endpoint()
             return
@@ -426,7 +435,7 @@ class LokiVmCharm(ops.CharmBase):
             relation.data[self.unit].pop("endpoint", None)
 
     def _clear_grafana_source_endpoint(self) -> None:
-        """Clear this unit's published Grafana datasource endpoint."""
+        """Remove this unit's datasource host entry from `grafana-source` data."""
         for relation in self.model.relations.get("grafana-source", []):
             relation.data[self.unit].pop("grafana_source_host", None)
 
@@ -445,12 +454,20 @@ class LokiVmCharm(ops.CharmBase):
         return self.ingress.url if self.ingress else None
 
     def _sorted_source_data(self) -> GrafanaSourceData:
-        """Return the first Grafana source data entry in sorted UID order."""
+        """Return deterministic Grafana source metadata for ruler link fields.
+
+        When multiple Grafana apps are related, this picks the first entry in
+        sorted `grafana_uid` order to keep rendered config stable.
+        """
         nested_data = self.grafana_source_provider.get_source_data()
         return nested_data[sorted(nested_data)[0]] if nested_data else GrafanaSourceData({}, None)
 
     def _update_datasource_exchange(self) -> None:
-        """Publish datasource UID mappings over grafana-datasource-exchange."""
+        """Publish Loki datasource UID mappings over `send-datasource`.
+
+        Leader-only operation: for each related Grafana instance, convert the
+        unit UID mapping into exchange payload entries with type `loki`.
+        """
         if not self._is_leader():
             return
         grafana_uids_to_units_to_uids = self.grafana_source_provider.get_source_uids()
