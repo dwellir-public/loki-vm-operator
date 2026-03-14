@@ -9,10 +9,13 @@ from ops import testing
 
 from charm import LokiVmCharm
 
-
 META = {
     "name": "loki-vm",
-    "provides": {"loki_push_api": {"interface": "loki_push_api"}},
+    "provides": {
+        "loki_push_api": {"interface": "loki_push_api"},
+        "grafana-source": {"interface": "grafana_datasource"},
+        "send-datasource": {"interface": "grafana_datasource_exchange"},
+    },
     "requires": {"ingress": {"interface": "ingress_per_unit"}},
     "peers": {"replicas": {"interface": "loki_replica"}},
     "storage": {"loki-persisted": {"type": "filesystem"}},
@@ -246,3 +249,87 @@ def test_external_url_non_leader_clears_endpoint(monkeypatch: pytest.MonkeyPatch
 
     relation_out = next(iter(state_out.relations))
     assert relation_out.local_unit_data.get("endpoint") is None
+
+
+def test_external_url_updates_grafana_source(monkeypatch: pytest.MonkeyPatch):
+    """Normalize external-url and publish it via GrafanaSourceProvider."""
+    ctx = _context()
+    captured = {}
+
+    def mock_update_source(self, source_url: str = ""):
+        captured["source_url"] = source_url
+
+    monkeypatch.setattr("charm.GrafanaSourceProvider.update_source", mock_update_source)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr("charm.LokiVmCharm._is_leader", lambda *_: True)
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "logs.example.com",
+        "config-override": "",
+    }
+
+    ctx.run(ctx.on.config_changed(), testing.State(config=config))
+
+    assert captured["source_url"] == "http://logs.example.com:3100"
+
+
+def test_external_url_non_leader_clears_grafana_source(monkeypatch: pytest.MonkeyPatch):
+    """Ensure non-leaders clear their grafana-source endpoint when external-url is set."""
+    ctx = _context()
+    relation = testing.Relation(
+        endpoint="grafana-source",
+        interface="grafana_datasource",
+        local_unit_data={"grafana_source_host": "stale"},
+    )
+
+    monkeypatch.setattr("charm.LokiVmCharm._is_leader", lambda *_: False)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "logs.example.com",
+        "config-override": "",
+    }
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(config=config, relations=[relation]),
+    )
+
+    relation_out = next(iter(state_out.relations))
+    assert relation_out.local_unit_data.get("grafana_source_host") is None
+
+
+def test_grafana_source_event_updates_datasource_exchange(monkeypatch: pytest.MonkeyPatch):
+    """Publish datasource UIDs to grafana-datasource-exchange on source changes."""
+    ctx = _context()
+    relation = testing.Relation(endpoint="grafana-source", interface="grafana_datasource")
+    captured = {}
+
+    def mock_get_source_uids(self):
+        return {"grafana-uid-1": {"loki/0": "ds-uid-1"}}
+
+    def mock_publish(self, datasources):
+        captured["datasources"] = datasources
+
+    monkeypatch.setattr("charm.GrafanaSourceProvider.get_source_uids", mock_get_source_uids)
+    monkeypatch.setattr("charm.DatasourceExchange.publish", mock_publish)
+    monkeypatch.setattr("charm.LokiVmCharm._is_leader", lambda *_: True)
+
+    ctx.run(
+        ctx.on.relation_changed(relation),
+        testing.State(relations=[relation]),
+    )
+
+    assert captured["datasources"] == [
+        {"type": "loki", "uid": "ds-uid-1", "grafana_uid": "grafana-uid-1"}
+    ]

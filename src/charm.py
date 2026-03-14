@@ -13,11 +13,13 @@ from urllib.parse import urlparse
 
 import ops
 import yaml
+from charms.grafana_k8s.v0.grafana_source import GrafanaSourceData, GrafanaSourceProvider
+from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
+from charms.traefik_k8s.v1.ingress_per_unit import IngressPerUnitRequirer
+from cosl.interfaces.datasource_exchange import DatasourceDict, DatasourceExchange
 
 # A standalone module for workload-specific logic (no charming concerns):
 import loki
-from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
-from charms.traefik_k8s.v1.ingress_per_unit import IngressPerUnitRequirer
 from config_builder import (
     DEFAULT_CONFIG_BACKUP_PATH,
     DEFAULT_CONFIG_PATH,
@@ -57,6 +59,17 @@ class LokiVmCharm(ops.CharmBase):
             scheme="http",
             path="loki/api/v1/push",
         )
+        self.grafana_source_provider = GrafanaSourceProvider(
+            charm=self,
+            relation_name="grafana-source",
+            source_type="loki",
+            source_url=self._external_url_base(),
+        )
+        self.datasource_exchange = DatasourceExchange(
+            self,
+            provider_endpoint="send-datasource",
+            requirer_endpoint=None,
+        )
         framework.observe(self.on.install, self._on_install)
         framework.observe(self.on.start, self._on_start)
         framework.observe(self.on.config_changed, self._on_config_changed)
@@ -64,6 +77,30 @@ class LokiVmCharm(ops.CharmBase):
         framework.observe(self.on.update_status, self._on_update_status)
         framework.observe(self.ingress.on.ready_for_unit, self._on_ingress_changed)
         framework.observe(self.ingress.on.revoked_for_unit, self._on_ingress_changed)
+        framework.observe(
+            self.on.send_datasource_relation_changed,
+            self._on_grafana_source_changed,
+        )
+        framework.observe(
+            self.on.send_datasource_relation_departed,
+            self._on_grafana_source_changed,
+        )
+        framework.observe(
+            self.on.grafana_source_relation_joined,
+            self._on_grafana_source_changed,
+        )
+        framework.observe(
+            self.on.grafana_source_relation_changed,
+            self._on_grafana_source_changed,
+        )
+        framework.observe(
+            self.on.grafana_source_relation_created,
+            self._on_grafana_source_changed,
+        )
+        framework.observe(
+            self.on.grafana_source_relation_departed,
+            self._on_grafana_source_changed,
+        )
         framework.observe(
             self.on.loki_persisted_storage_attached, self._on_loki_persisted_storage_attached
         )
@@ -92,6 +129,8 @@ class LokiVmCharm(ops.CharmBase):
         if version is not None:
             self.unit.set_workload_version(version)
         self._refresh_loki_provider_endpoint()
+        self._refresh_grafana_source_endpoint()
+        self._update_datasource_exchange()
         if config_ok:
             self.unit.status = ops.ActiveStatus()
         else:
@@ -101,6 +140,7 @@ class LokiVmCharm(ops.CharmBase):
         """Re-render and apply configuration when charm config changes."""
         self.unit.status = ops.MaintenanceStatus("configuring Loki")
         self._refresh_loki_provider_endpoint()
+        self._refresh_grafana_source_endpoint()
         if self._configure():
             self.unit.status = ops.ActiveStatus("Loki configuration updated and validated.")
         else:
@@ -117,11 +157,16 @@ class LokiVmCharm(ops.CharmBase):
             return
         self._reconcile_config_drift_status()
         if self._is_service_down_status() and not self._stored.config_drifted:
-            self.unit.status = ops.ActiveStatus()
+            self.unit.status = ops.ActiveStatus("Loki configuration updated and validated.")
 
     def _on_ingress_changed(self, event: ops.EventBase) -> None:
         """Handle ingress updates by refreshing the published endpoint."""
         self._refresh_loki_provider_endpoint()
+        self._refresh_grafana_source_endpoint()
+
+    def _on_grafana_source_changed(self, event: ops.EventBase) -> None:
+        """Handle Grafana source relation changes and update datasource exchange."""
+        self._update_datasource_exchange()
 
     def _on_replicas_changed(self, event: ops.RelationEvent) -> None:
         """Handle peer relation changes and reconfigure memberlist joins."""
@@ -146,7 +191,10 @@ class LokiVmCharm(ops.CharmBase):
     def _on_loki_persisted_storage_detaching(self, event: ops.StorageDetachingEvent) -> None:
         """Restore default data dir when loki-persisted storage detaches."""
         self._stored.data_dir = DEFAULT_DATA_DIR
-        logger.warning("loki-persisted storage detaching; data dir will be reset to %s", self._stored.data_dir)
+        logger.warning(
+            "loki-persisted storage detaching; data dir will be reset to %s",
+            self._stored.data_dir,
+        )
         loki.ensure_data_dir(self._stored.data_dir)
 
     @property
@@ -223,12 +271,15 @@ class LokiVmCharm(ops.CharmBase):
         override = str(self.config.get("config-override", "")).strip()
         if override:
             return override
+        source_data = self._sorted_source_data()
         builder = ConfigBuilder(
             instance_addr=self._instance_addr(),
             ingestion_rate_mb=int(self.config["ingestion-rate-mb"]),
             ingestion_burst_size_mb=int(self.config["ingestion-burst-size-mb"]),
             retention_period=int(self.config["retention-period"]),
             reporting_enabled=bool(self.config["reporting-enabled"]),
+            grafana_external_url=source_data.external_url,
+            datasource_uid=source_data.get_unit_uid(self.unit.name),
             data_dir=self.data_dir,
             memberlist_join_members=self._memberlist_join_members(),
         )
@@ -267,7 +318,7 @@ class LokiVmCharm(ops.CharmBase):
                 self.unit.status = ops.MaintenanceStatus(self._config_drift_message())
             return
         if self._is_drift_status():
-            self.unit.status = ops.ActiveStatus()
+            self.unit.status = ops.MaintenanceStatus("Loki configuration drift cleared.")
 
     def _has_config_drift(self) -> bool:
         """Return True when on-disk config differs from the last good config."""
@@ -344,6 +395,13 @@ class LokiVmCharm(ops.CharmBase):
         if url:
             self.loki_provider.update_endpoint(url=url)
 
+    def _refresh_grafana_source_endpoint(self) -> None:
+        """Publish Grafana datasource endpoint to relation data."""
+        if self._external_url_configured() and not self._is_leader():
+            self._clear_grafana_source_endpoint()
+            return
+        self.grafana_source_provider.update_source(source_url=self._external_url_base())
+
     def _external_url_base(self) -> str:
         """Return base URL (scheme://host:port[/path]) for Loki ingress."""
         external = str(self.config.get("external-url", "")).strip()
@@ -367,6 +425,11 @@ class LokiVmCharm(ops.CharmBase):
         for relation in self.model.relations.get("loki_push_api", []):
             relation.data[self.unit].pop("endpoint", None)
 
+    def _clear_grafana_source_endpoint(self) -> None:
+        """Clear this unit's published Grafana datasource endpoint."""
+        for relation in self.model.relations.get("grafana-source", []):
+            relation.data[self.unit].pop("grafana_source_host", None)
+
     def _normalize_external_url(self, url: str) -> str:
         """Normalize external-url into a scheme://host:port[/path] base URL."""
         parsed = urlparse(url if "://" in url else f"http://{url}")
@@ -380,6 +443,24 @@ class LokiVmCharm(ops.CharmBase):
     def _ingress_url(self) -> str | None:
         """Return the ingress URL for this unit when available."""
         return self.ingress.url if self.ingress else None
+
+    def _sorted_source_data(self) -> GrafanaSourceData:
+        """Return the first Grafana source data entry in sorted UID order."""
+        nested_data = self.grafana_source_provider.get_source_data()
+        return nested_data[sorted(nested_data)[0]] if nested_data else GrafanaSourceData({}, None)
+
+    def _update_datasource_exchange(self) -> None:
+        """Publish datasource UID mappings over grafana-datasource-exchange."""
+        if not self._is_leader():
+            return
+        grafana_uids_to_units_to_uids = self.grafana_source_provider.get_source_uids()
+        raw_datasources: list[DatasourceDict] = []
+        for grafana_uid, ds_uids in grafana_uids_to_units_to_uids.items():
+            for _, ds_uid in ds_uids.items():
+                raw_datasources.append(
+                    {"type": "loki", "uid": ds_uid, "grafana_uid": grafana_uid}
+                )
+        self.datasource_exchange.publish(datasources=raw_datasources)
 
 
 if __name__ == "__main__":  # pragma: nocover

@@ -35,6 +35,16 @@ provides:
   loki_push_api:
     interface: loki_push_api
     description: Integration to receive logs from other charms.
+  grafana-source:
+    interface: grafana_datasource
+    optional: true
+    description: |
+      Configures Grafana to be able to use this Loki instance as a datasource.
+  send-datasource:
+    interface: grafana_datasource_exchange
+    optional: true
+    description: |
+      Integration to share this charm's Grafana datasource data with other COS components.
 
 requires:
   ingress:
