@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -26,9 +27,22 @@ from config_builder import (
     DEFAULT_DATA_DIR,
     DEFAULT_PACKAGE_CONFIG_BACKUP_PATH,
     ConfigBuilder,
+    S3StorageConfig,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidConfigurationError(RuntimeError):
+    """Raised when charm configuration or relation data is invalid."""
+
+
+@dataclass(frozen=True)
+class StorageBackendState:
+    """Resolved storage backend state for the current unit."""
+
+    status: ops.StatusBase | None
+    s3: S3StorageConfig | None
 
 
 class LokiVmCharm(ops.CharmBase):
@@ -75,6 +89,7 @@ class LokiVmCharm(ops.CharmBase):
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
         framework.observe(self.on.update_status, self._on_update_status)
+        framework.observe(self.on.secret_changed, self._on_secret_changed)
         framework.observe(self.ingress.on.ready_for_unit, self._on_ingress_changed)
         framework.observe(self.ingress.on.revoked_for_unit, self._on_ingress_changed)
         framework.observe(
@@ -107,6 +122,10 @@ class LokiVmCharm(ops.CharmBase):
         framework.observe(
             self.on.loki_persisted_storage_detaching, self._on_loki_persisted_storage_detaching
         )
+        framework.observe(self.on.s3_relation_created, self._on_s3_changed)
+        framework.observe(self.on.s3_relation_joined, self._on_s3_changed)
+        framework.observe(self.on.s3_relation_changed, self._on_s3_changed)
+        framework.observe(self.on.s3_relation_broken, self._on_s3_changed)
         framework.observe(self.on.replicas_relation_joined, self._on_replicas_changed)
         framework.observe(self.on.replicas_relation_changed, self._on_replicas_changed)
         framework.observe(self.on.replicas_relation_departed, self._on_replicas_changed)
@@ -123,28 +142,26 @@ class LokiVmCharm(ops.CharmBase):
         """Start Loki, apply config, and set workload/version status."""
         self.unit.status = ops.MaintenanceStatus("starting workload")
         loki.ensure_data_dir(self.data_dir)
-        config_ok = self._configure()
+        self._refresh_loki_provider_endpoint()
+        self._refresh_grafana_source_endpoint()
+        storage_state = self._storage_backend_state()
+        if storage_state.status is not None:
+            self.unit.status = storage_state.status
+            return
+        config_ok, _ = self._configure()
+        if not config_ok:
+            self.unit.status = self._invalid_config_status()
+            return
         loki.start()
         version = loki.get_version()
         if version is not None:
             self.unit.set_workload_version(version)
-        self._refresh_loki_provider_endpoint()
-        self._refresh_grafana_source_endpoint()
         self._update_datasource_exchange()
-        if config_ok:
-            self.unit.status = ops.ActiveStatus()
-        else:
-            self.unit.status = self._invalid_config_status()
+        self.unit.status = self._active_status()
 
     def _on_config_changed(self, event: ops.ConfigChangedEvent) -> None:
         """Re-render and apply configuration when charm config changes."""
-        self.unit.status = ops.MaintenanceStatus("configuring Loki")
-        self._refresh_loki_provider_endpoint()
-        self._refresh_grafana_source_endpoint()
-        if self._configure():
-            self.unit.status = ops.ActiveStatus("Loki configuration updated and validated.")
-        else:
-            self.unit.status = self._invalid_config_status()
+        self._reconcile_runtime(status_message="configuring Loki")
 
     def _on_upgrade_charm(self, event: ops.UpgradeCharmEvent) -> None:
         """Handle charm upgrade without restarting or rewriting configuration."""
@@ -152,12 +169,16 @@ class LokiVmCharm(ops.CharmBase):
 
     def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
         """Handle periodic status updates (detect drift and workload health)."""
+        storage_state = self._storage_backend_state()
+        if storage_state.status is not None:
+            self.unit.status = storage_state.status
+            return
         if not loki.is_active():
             self.unit.status = ops.MaintenanceStatus("Loki service not running")
             return
         self._reconcile_config_drift_status()
         if self._is_service_down_status() and not self._stored.config_drifted:
-            self.unit.status = ops.ActiveStatus("Loki configuration updated and validated.")
+            self.unit.status = self._active_status()
 
     def _on_ingress_changed(self, event: ops.EventBase) -> None:
         """Handle ingress updates by refreshing the published endpoint."""
@@ -176,11 +197,20 @@ class LokiVmCharm(ops.CharmBase):
         """Handle peer relation changes and reconfigure memberlist joins."""
         if event.relation:
             event.relation.data[self.unit]["address"] = self._instance_addr()
-        self.unit.status = ops.MaintenanceStatus("updating cluster configuration")
-        if self._configure():
-            self.unit.status = ops.ActiveStatus("Loki configuration updated and validated.")
-        else:
-            self.unit.status = self._invalid_config_status()
+        self._reconcile_runtime(status_message="updating cluster configuration")
+
+    def _on_s3_changed(self, event: ops.EventBase) -> None:
+        """Handle S3 relation changes and reconfigure storage."""
+        self._reconcile_runtime(status_message="updating storage configuration")
+
+    def _on_secret_changed(self, event: ops.SecretChangedEvent) -> None:
+        """Reconcile when an observed secret backing S3 credentials changes."""
+        relation = self.model.get_relation("s3")
+        if relation is None or relation.app is None:
+            return
+        secret_id = relation.data[relation.app].get("secret-key-secret-id", "").strip()
+        if secret_id and secret_id == event.secret.id:
+            self._reconcile_runtime(status_message="updating storage credentials")
 
     def _on_loki_persisted_storage_attached(self, event: ops.StorageAttachedEvent) -> None:
         """Update data dir when loki-persisted storage is attached."""
@@ -206,7 +236,26 @@ class LokiVmCharm(ops.CharmBase):
         """Return the data directory for Loki (storage if attached, else default)."""
         return str(self._stored.data_dir)
 
-    def _configure(self) -> bool:
+    def _reconcile_runtime(self, *, status_message: str) -> None:
+        """Re-render config, publish endpoints, and restart when needed."""
+        self.unit.status = ops.MaintenanceStatus(status_message)
+        self._refresh_loki_provider_endpoint()
+        self._refresh_grafana_source_endpoint()
+        storage_state = self._storage_backend_state()
+        if storage_state.status is not None:
+            self.unit.status = storage_state.status
+            return
+        config_ok, config_changed = self._configure()
+        if not config_ok:
+            self.unit.status = self._invalid_config_status()
+            return
+        if config_changed:
+            self._restart_if_running()
+        self._set_workload_version()
+        self._update_datasource_exchange()
+        self.unit.status = self._active_status()
+
+    def _configure(self) -> tuple[bool, bool]:
         """Render, validate, and persist Loki configuration.
 
         Flow:
@@ -220,7 +269,7 @@ class LokiVmCharm(ops.CharmBase):
         loki.ensure_data_dir_permissions(self.data_dir)
         config_text = self._render_config_text()
         if not config_text:
-            return True
+            return True, False
         if not self._validate_config_text(config_text):
             logger.warning("Configuration validation failed; keeping previous config.")
             failed_path = self._persist_failed_config(config_text)
@@ -228,7 +277,15 @@ class LokiVmCharm(ops.CharmBase):
                 self._stored.last_failed_config_path = str(failed_path)
             if self._stored.last_good_config:
                 self.unit.status = self._invalid_config_status()
-            return False
+            return False, False
+        on_disk = self._read_config_from_disk()
+        config_changed = (
+            self._stored.last_good_config != config_text
+            or on_disk != config_text
+            or self._stored.config_drifted
+        )
+        if not config_changed:
+            return True, False
         loki.write_config_text(
             config_text,
             config_path=Path(DEFAULT_CONFIG_PATH),
@@ -239,7 +296,7 @@ class LokiVmCharm(ops.CharmBase):
         if self._stored.config_drifted:
             logger.info("Loki config drift resolved by applying charm configuration.")
         self._stored.config_drifted = False
-        return True
+        return True, True
 
     def _persist_failed_config(self, config_text: str) -> Path | None:
         """Persist a failed config to /tmp for debugging."""
@@ -286,6 +343,7 @@ class LokiVmCharm(ops.CharmBase):
             datasource_uid=source_data.get_unit_uid(self.unit.name),
             data_dir=self.data_dir,
             memberlist_join_members=self._memberlist_join_members(),
+            s3=self._storage_backend_state().s3,
         )
         rendered = yaml.safe_dump(builder.build(), sort_keys=False)
         return f"{loki.GENERATED_CONFIG_HEADER}{rendered}"
@@ -348,6 +406,14 @@ class LokiVmCharm(ops.CharmBase):
         """Return the Maintenance status message for config drift."""
         return f"Manual Loki config change detected at {DEFAULT_CONFIG_PATH}"
 
+    def _active_status(self) -> ops.ActiveStatus:
+        """Return the steady-state active status message."""
+        if self._storage_backend_state().s3 is not None:
+            return ops.ActiveStatus(
+                "Loki configuration updated and validated (Garage S3 backend)."
+            )
+        return ops.ActiveStatus("Loki configuration updated and validated.")
+
     def _is_drift_status(self) -> bool:
         """Return True if the unit is in the drift Maintenance status."""
         return (
@@ -364,12 +430,15 @@ class LokiVmCharm(ops.CharmBase):
 
     def _instance_addr(self) -> str:
         """Return the best-available address for the Loki ring and endpoints."""
-        if getattr(self.unit, "private_address", None):
-            return str(self.unit.private_address)
-        if getattr(self.unit, "public_address", None):
-            return str(self.unit.public_address)
-        if getattr(self.unit, "address", None):
-            return str(self.unit.address)
+        private_address = getattr(self.unit, "private_address", None)
+        if private_address:
+            return str(private_address)
+        public_address = getattr(self.unit, "public_address", None)
+        if public_address:
+            return str(public_address)
+        address = getattr(self.unit, "address", None)
+        if address:
+            return str(address)
         for endpoint in ("replicas", "loki_push_api", "ingress"):
             binding = self.model.get_binding(endpoint)
             if binding and binding.network.bind_address:
@@ -389,6 +458,107 @@ class LokiVmCharm(ops.CharmBase):
             if addr and addr != self._instance_addr():
                 members.append(addr)
         return members
+
+    def _storage_backend_state(self) -> StorageBackendState:
+        """Return the resolved storage backend and any blocking/waiting status."""
+        relation = self.model.get_relation("s3")
+        if relation is None or relation.app is None:
+            if self.app.planned_units() > 1:
+                return StorageBackendState(
+                    status=ops.WaitingStatus("waiting for s3 relation for clustered Loki"),
+                    s3=None,
+                )
+            return StorageBackendState(status=None, s3=None)
+
+        try:
+            s3 = self._s3_relation_details()
+        except ops.SecretNotFoundError:
+            return StorageBackendState(
+                status=ops.WaitingStatus("waiting for s3 credentials"),
+                s3=None,
+            )
+        except InvalidConfigurationError as exc:
+            return StorageBackendState(status=ops.BlockedStatus(str(exc)), s3=None)
+
+        if s3 is None:
+            return StorageBackendState(
+                status=ops.WaitingStatus("waiting for complete s3 relation data"),
+                s3=None,
+            )
+        return StorageBackendState(status=None, s3=s3)
+
+    def _s3_relation_details(self) -> S3StorageConfig | None:
+        """Return relation-provided S3 configuration when available."""
+        relation = self.model.get_relation("s3")
+        if relation is None or relation.app is None:
+            return None
+        app_data = relation.data[relation.app]
+        required = ("endpoint", "bucket", "access-key", "secret-key-secret-id", "region")
+        if any(not app_data.get(field, "").strip() for field in required):
+            return None
+
+        secret = self.model.get_secret(id=app_data["secret-key-secret-id"].strip())
+        content = secret.get_content(refresh=True)
+        secret_key = content.get("secret-key", "").strip()
+        if not secret_key:
+            return None
+
+        return S3StorageConfig(
+            bucket=app_data["bucket"].strip(),
+            endpoint=self._normalize_s3_endpoint(app_data["endpoint"]),
+            access_key_id=app_data["access-key"].strip(),
+            secret_access_key=secret_key,
+            region=app_data["region"].strip(),
+            insecure=self._s3_is_insecure(app_data),
+        )
+
+    def _normalize_s3_endpoint(self, value: str) -> str:
+        """Convert relation endpoint values into Loki's expected host:port format."""
+        endpoint = value.strip().rstrip("/")
+        parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+        if parsed.hostname is None:
+            raise InvalidConfigurationError(f"Invalid s3 endpoint {value!r}")
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return f"{host}:{port}"
+
+    def _s3_is_insecure(self, app_data: ops.RelationDataContent) -> bool:
+        """Infer whether the S3 endpoint should use HTTP."""
+        endpoint = app_data["endpoint"].strip().lower()
+        if endpoint.startswith("http://"):
+            return True
+        insecure = app_data.get("insecure", "").strip()
+        if insecure:
+            return self._parse_bool(insecure, field_name="insecure")
+        tls = app_data.get("tls", "").strip()
+        if tls:
+            return not self._parse_bool(tls, field_name="tls")
+        return False
+
+    def _parse_bool(self, value: str, *, field_name: str) -> bool:
+        """Parse a boolean relation field."""
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        raise InvalidConfigurationError(
+            f"Invalid s3 relation field {field_name!r}: expected boolean, got {value!r}"
+        )
+
+    def _set_workload_version(self) -> None:
+        """Publish workload version when available."""
+        version = loki.get_version()
+        if version is not None:
+            self.unit.set_workload_version(version)
+
+    def _restart_if_running(self) -> None:
+        """Restart Loki after a config change when the workload is already installed."""
+        if loki.is_active():
+            loki.restart()
+            return
+        if loki.get_version() is not None:
+            loki.start()
 
     def _refresh_loki_provider_endpoint(self) -> None:
         """Publish Loki push API endpoint to relation data."""

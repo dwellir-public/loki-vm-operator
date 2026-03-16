@@ -71,6 +71,7 @@ juju exec --unit loki-vm/0 -- bash -lc 'end=$(date +%s%N); start=$((end-5*60*100
 Supported relations:
 - `replicas` (peers) for clustering
 - `ingress` (ingress_per_unit)
+- `s3` (requires) for Garage-backed object storage
 - `loki_push_api` (provides Loki push endpoint)
 
 ## 3-node cluster behavior
@@ -79,6 +80,37 @@ When deployed with three units, `loki-vm` forms a memberlist cluster. Each unit
 advertises its address to peers and the ring uses `memberlist.join_members` to
 discover the other units. This assumes a shared backend storage (S3/MinIO) if you
 intend to ingest to multiple units.
+
+### Object storage behavior
+
+`loki-vm` now supports the `garage-vm:s3` relation.
+
+- Without an `s3` relation, single-unit Loki stays on the local filesystem.
+- With an `s3` relation, Loki switches to TSDB single-store on S3.
+- Multi-unit clustered Loki now waits for `s3` before claiming it is fully
+  configured.
+
+Local disk is still used for:
+
+- WAL
+- active TSDB index files
+- TSDB cache
+- compactor working files
+- local rules state
+
+Garage object storage is used for:
+
+- shipped TSDB blocks
+- shipped TSDB index data
+- retention delete-request state when retention is enabled
+
+Example clustered deployment with Garage:
+
+```bash
+juju deploy ./garage-vm_ubuntu@24.04-amd64.charm garage-vm --num-units 3 --config replication-mode=3
+juju deploy ./loki-vm_ubuntu-24.04-amd64.charm loki-vm --num-units 3 --storage loki-persisted=rootfs,2G
+juju integrate loki-vm:s3 garage-vm:s3
+```
 
 ### Ingestion endpoint publishing
 

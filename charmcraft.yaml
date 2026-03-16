@@ -55,6 +55,13 @@ requires:
       Ingress integration for Loki, so that cross-model workloads can send their logs
       to Loki through the ingress.
       Loki uses "ingress per unit" (not per app), so each unit gets ingressed separately.
+  s3:
+    interface: s3
+    optional: true
+    limit: 1
+    description: |
+      Consume S3 credentials and endpoint information from garage-vm for Loki TSDB
+      object storage.
 
 peers:
   replicas:

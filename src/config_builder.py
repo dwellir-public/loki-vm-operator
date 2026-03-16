@@ -4,6 +4,7 @@
 """Config builder for Loki VM charm."""
 
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 HTTP_LISTEN_PORT = 3100
@@ -19,6 +20,18 @@ DEFAULT_DATA_DIR = "/var/lib/loki"
 
 # Backup path for the config
 DEFAULT_CONFIG_BACKUP_PATH = os.path.join(DEFAULT_DATA_DIR, "config.yml.bak")
+
+
+@dataclass(frozen=True)
+class S3StorageConfig:
+    """S3 configuration used for Loki TSDB single-store."""
+
+    bucket: str
+    endpoint: str
+    access_key_id: str
+    secret_access_key: str
+    region: str
+    insecure: bool
 
 
 class ConfigBuilder:
@@ -48,6 +61,7 @@ class ConfigBuilder:
         grafana_external_url: Optional[str] = None,
         datasource_uid: Optional[str] = None,
         memberlist_join_members: Optional[List[str]] = None,
+        s3: Optional[S3StorageConfig] = None,
     ):
         """Init method."""
         self.instance_addr = instance_addr
@@ -61,6 +75,7 @@ class ConfigBuilder:
         self.grafana_external_url = grafana_external_url
         self.datasource_uid = datasource_uid
         self.memberlist_join_members = memberlist_join_members
+        self.s3 = s3
 
         self.data_dir = data_dir
         self.chunks_dir = os.path.join(self.data_dir, "chunks")
@@ -104,17 +119,19 @@ class ConfigBuilder:
         kvstore = {"store": "inmemory"}
         if self.memberlist_join_members is not None:
             kvstore = {"store": "memberlist"}
-        return {
+        common = {
             "path_prefix": self.data_dir,
             "replication_factor": 1,
             "ring": {"instance_addr": self.instance_addr, "kvstore": kvstore},
-            "storage": {
+        }
+        if self.s3 is None:
+            common["storage"] = {
                 "filesystem": {
                     "chunks_directory": self.chunks_dir,
                     "rules_directory": self.rules_dir,
                 }
             },
-        }
+        return common
 
     @property
     def _ingester(self) -> dict:
@@ -146,7 +163,7 @@ class ConfigBuilder:
             {
                 "from": "2020-10-24",
                 "index": {"period": "24h", "prefix": "index_"},
-                "object_store": "filesystem",
+                "object_store": "s3" if self.s3 else "filesystem",
                 "schema": "v13",
                 "store": "tsdb",
             }
@@ -158,7 +175,7 @@ class ConfigBuilder:
                     {
                         "from": migration["date"],
                         "index": {"period": "24h", "prefix": "index_"},
-                        "object_store": "filesystem",
+                        "object_store": "s3" if self.s3 else "filesystem",
                         "schema": migration["version"],
                         "store": "tsdb",
                     }
@@ -183,13 +200,25 @@ class ConfigBuilder:
 
     @property
     def _storage_config(self) -> dict:
-        return {
+        storage_config: dict[str, object] = {
             "tsdb_shipper": {
                 "active_index_directory": self.tsdb_dir,
                 "cache_location": self.tsdb_cache_dir,
-            },
-            "filesystem": {"directory": self.chunks_dir},
+            }
         }
+        if self.s3 is None:
+            storage_config["filesystem"] = {"directory": self.chunks_dir}
+            return storage_config
+        storage_config["aws"] = {
+            "bucketnames": self.s3.bucket,
+            "endpoint": self.s3.endpoint,
+            "region": self.s3.region,
+            "access_key_id": self.s3.access_key_id,
+            "secret_access_key": self.s3.secret_access_key,
+            "insecure": self.s3.insecure,
+            "s3forcepathstyle": True,
+        }
+        return storage_config
 
     @property
     def _limits_config(self) -> dict:
@@ -249,7 +278,7 @@ class ConfigBuilder:
             "working_directory": self.compactor_dir,
         }
         if retention_enabled:
-            compactor["delete_request_store"] = "filesystem"
+            compactor["delete_request_store"] = "s3" if self.s3 else "filesystem"
         return compactor
 
     @property

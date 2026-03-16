@@ -16,7 +16,10 @@ META = {
         "grafana-source": {"interface": "grafana_datasource"},
         "send-datasource": {"interface": "grafana_datasource_exchange"},
     },
-    "requires": {"ingress": {"interface": "ingress_per_unit"}},
+    "requires": {
+        "ingress": {"interface": "ingress_per_unit"},
+        "s3": {"interface": "s3", "limit": 1},
+    },
     "peers": {"replicas": {"interface": "loki_replica"}},
     "storage": {"loki-persisted": {"type": "filesystem"}},
 }
@@ -40,6 +43,41 @@ def _context() -> testing.Context:
 def mock_get_version():
     """Get a mock version string without executing the workload code."""
     return "1.0.0"
+
+
+class _FakeSecret:
+    def get_content(self, *, refresh: bool = False):  # noqa: ARG002
+        return {"secret-key": "very-secret"}
+
+
+def _s3_relation(
+    *,
+    endpoint: str = "http://10.0.0.10:3900",
+    tls: str = "false",
+    insecure: str = "true",
+) -> testing.Relation:
+    return testing.Relation(
+        "s3",
+        interface="s3",
+        remote_app_name="garage-vm",
+        remote_app_data={
+            "endpoint": endpoint,
+            "bucket": "juju-s3-rel-10",
+            "access-key": "access",
+            "secret-key-secret-id": "secret:relation-10",
+            "region": "garage",
+            "tls": tls,
+            "insecure": insecure,
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
+def _mock_workload_calls(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: False)
+    monkeypatch.setattr("charm.loki.get_version", lambda: None)
+    monkeypatch.setattr("charm.loki.start", lambda: None)
+    monkeypatch.setattr("charm.loki.restart", lambda: None)
 
 
 def test_start(monkeypatch: pytest.MonkeyPatch):
@@ -333,3 +371,92 @@ def test_grafana_source_event_updates_datasource_exchange(monkeypatch: pytest.Mo
     assert captured["datasources"] == [
         {"type": "loki", "uid": "ds-uid-1", "grafana_uid": "grafana-uid-1"}
     ]
+
+
+def test_clustered_loki_waits_for_s3(monkeypatch: pytest.MonkeyPatch):
+    """A multi-unit deployment should wait for object storage before configuring."""
+    ctx = _context()
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(planned_units=3))
+
+    assert isinstance(state_out.unit_status, testing.WaitingStatus)
+    assert state_out.unit_status.message == "waiting for s3 relation for clustered Loki"
+
+
+def test_s3_relation_renders_garage_backed_config(monkeypatch: pytest.MonkeyPatch):
+    """A valid s3 relation should switch the rendered config to S3-backed TSDB."""
+    ctx = _context()
+    seen = {}
+
+    def mock_write_config_text(config_text: str, **_):
+        seen["config"] = config_text
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+    monkeypatch.setattr("charm.ops.Model.get_secret", lambda *_args, **_kwargs: _FakeSecret())
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(relations=[_s3_relation()], planned_units=1),
+    )
+
+    rendered = "\n".join(
+        line for line in seen["config"].splitlines() if not line.startswith("#")
+    )
+    config_yaml = yaml.safe_load(rendered)
+
+    assert config_yaml["schema_config"]["configs"][0]["object_store"] == "s3"
+    assert config_yaml["storage_config"]["aws"]["bucketnames"] == "juju-s3-rel-10"
+    assert config_yaml["storage_config"]["aws"]["endpoint"] == "10.0.0.10:3900"
+    assert config_yaml["storage_config"]["aws"]["s3forcepathstyle"] is True
+    assert config_yaml["compactor"]["working_directory"].endswith("compactor")
+    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+
+def test_s3_relation_with_retention_uses_s3_delete_store(monkeypatch: pytest.MonkeyPatch):
+    """Retention in S3 mode should use S3 for delete requests."""
+    ctx = _context()
+    seen = {}
+
+    def mock_write_config_text(config_text: str, **_):
+        seen["config"] = config_text
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+    monkeypatch.setattr("charm.ops.Model.get_secret", lambda *_args, **_kwargs: _FakeSecret())
+
+    ctx.run(
+        ctx.on.config_changed(),
+        testing.State(
+            config={"retention-period": 7},
+            relations=[_s3_relation()],
+            planned_units=1,
+        ),
+    )
+
+    rendered = "\n".join(
+        line for line in seen["config"].splitlines() if not line.startswith("#")
+    )
+    config_yaml = yaml.safe_load(rendered)
+    assert config_yaml["compactor"]["delete_request_store"] == "s3"
+
+
+def test_incomplete_s3_relation_waits(monkeypatch: pytest.MonkeyPatch):
+    """Incomplete s3 relation data should not overwrite config."""
+    ctx = _context()
+    relation = testing.Relation(
+        "s3",
+        interface="s3",
+        remote_app_name="garage-vm",
+        remote_app_data={"endpoint": "http://10.0.0.10:3900"},
+    )
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(relations=[relation]))
+
+    assert isinstance(state_out.unit_status, testing.WaitingStatus)
+    assert state_out.unit_status.message == "waiting for complete s3 relation data"

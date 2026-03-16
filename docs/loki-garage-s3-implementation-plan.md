@@ -187,15 +187,15 @@ Notes:
 
 ## Proposed delivery phases
 
-- [ ] Phase 0: Add `docs/` planning and record design decisions
-- [ ] Phase 1: Add `s3` relation metadata and relation/secret parsing helpers
-- [ ] Phase 2: Add config-builder support for filesystem vs Garage-backed S3
-- [ ] Phase 3: Add charm reconciliation, statuses, and last-known-good handling
-- [ ] Phase 4: Add unit tests for relation parsing, secret resolution, and
+- [x] Phase 0: Add `docs/` planning and record design decisions
+- [x] Phase 1: Add `s3` relation metadata and relation/secret parsing helpers
+- [x] Phase 2: Add config-builder support for filesystem vs Garage-backed S3
+- [x] Phase 3: Add charm reconciliation, statuses, and last-known-good handling
+- [x] Phase 4: Add unit tests for relation parsing, secret resolution, and
       rendered Loki config
-- [ ] Phase 5: Redeploy `loki-vm` against a live `garage-vm` cluster and
+- [x] Phase 5: Redeploy `loki-vm` against a live `garage-vm` cluster and
       validate end-to-end ingestion/query
-- [ ] Phase 6: Update README with deployment and operational guidance
+- [x] Phase 6: Update README with deployment and operational guidance
 
 ## Validation plan
 
@@ -235,4 +235,3 @@ Notes:
   absent, because shared durable storage is the expected model
 - Let relation-driven S3 mode take precedence over filesystem defaults
 - Add a small status or action later if operators need explicit visibility
-
