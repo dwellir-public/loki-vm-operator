@@ -28,7 +28,7 @@ CONFIG_SPEC = {
     "options": {
         "ingestion-rate-mb": {"type": "int", "default": 4},
         "ingestion-burst-size-mb": {"type": "int", "default": 15},
-        "retention-period": {"type": "int", "default": 0},
+        "retention-period": {"type": "int", "default": 14},
         "reporting-enabled": {"type": "boolean", "default": True},
         "external-url": {"type": "string", "default": ""},
         "config-override": {"type": "string", "default": ""},

@@ -92,10 +92,11 @@ config:
       default: 15
     retention-period:
       description: |
-        Global retention period in days. 0 disables retention (default).
+        Global retention period in days. Defaults to 14 days as a guard against
+        unbounded storage growth; 0 disables retention.
         Ref: https://grafana.com/docs/loki/latest/operations/storage/retention/
       type: int
-      default: 0
+      default: 14
     reporting-enabled:
       description: |
         Enable anonymous usage reporting to stats.grafana.org.

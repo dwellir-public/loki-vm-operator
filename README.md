@@ -108,9 +108,143 @@ Example clustered deployment with Garage:
 
 ```bash
 juju deploy ./garage-vm_ubuntu@24.04-amd64.charm garage-vm --num-units 3 --config replication-mode=3
-juju deploy ./loki-vm_ubuntu-24.04-amd64.charm loki-vm --num-units 3 --storage loki-persisted=rootfs,2G
+juju deploy ./loki-vm_ubuntu-24.04-amd64.charm loki-vm --num-units 3 --storage loki-persisted=rootfs,2G --config retention-period=30
 juju integrate loki-vm:s3 garage-vm:s3
 ```
+
+Set `retention-period` deliberately for any deployment that is meant to run for
+longer than short-lived testing. The charm now defaults to `14` days as a guard
+against unbounded growth, but operators should still choose a value that fits
+their expected workload and available storage. A finite value such as `14`,
+`30`, or `60` protects against eventually depleting available storage in
+Garage-backed object storage.
+
+### How ingestion works
+
+For clustered `loki-vm`, it is useful to separate Loki replication from Garage
+replication:
+
+1. A client such as Alloy pushes logs to the published Loki write endpoint.
+2. The receiving Loki unit acts as distributor and routes the stream according
+   to the Loki ring.
+3. In the current charm, Loki runs with `common.replication_factor: 1`, so a
+   given write is ingested once by the owning ingester rather than being copied
+   to all Loki units.
+4. Loki then persists durable data through its configured storage backend.
+5. When `loki-vm` is related to `garage-vm:s3`, that durable data is stored in
+   Garage-backed object storage.
+
+This means:
+
+- `garage-vm replication-mode=3` replicates object data across the three Garage
+  nodes.
+- it does **not** mean Loki writes every log line to all three Loki units.
+- in the current implementation, durable backend storage is replicated by
+  Garage, while Loki ingestion itself is not triplicated across all ingesters.
+
+So the effective model is:
+
+- one logical Loki ingest per stream write, according to the Loki ring, and
+- replicated object storage durability underneath, provided by Garage.
+
+### Rough storage sizing
+
+For `loki-vm` related to `garage-vm:s3`, long-term retained data is primarily
+stored in Garage object storage. Local Loki disk is still needed for WAL, cache,
+and compactor working files, but object storage is the main capacity driver.
+
+Use this rough equation for logical retained Loki data:
+
+```text
+S_logical = N * E * B * 86400 * R * ((1 + I) / C)
+```
+
+Where:
+
+- `N` = number of servers
+- `E` = average log entries per second per server
+- `B` = average bytes per log entry
+- `R` = retention in days
+- `I` = metadata/index overhead fraction
+- `C` = raw-to-stored compression ratio
+
+Then estimate physical Garage storage consumed as:
+
+```text
+S_physical = S_logical * G
+```
+
+Where:
+
+- `G` = Garage replication factor
+- for `garage-vm --config replication-mode=3`, use `G = 3`
+
+Useful rule-of-thumb values for syslog:
+
+- `B`: `200` to `350` bytes per line
+- `C`: `4` to `8`
+- `I`: `0.05` to `0.20`
+
+Worked example for `10` servers sending a normal syslog workload:
+
+- `N = 10`
+- `E = 10` lines/sec/server
+- `B = 250`
+- `R = 30` days
+- `I = 0.10`
+- `C = 5`
+- `G = 3`
+
+Raw ingest per day:
+
+```text
+GiB/day_raw = (N * E * B * 86400) / 1024^3
+            ≈ 2.01 GiB/day
+```
+
+Logical retained Loki data:
+
+```text
+GiB_logical_total = 2.01 * 30 * (1.10 / 5)
+                  ≈ 13.3 GiB
+```
+
+Physical Garage storage with replication `3`:
+
+```text
+GiB_garage_physical = 13.3 * 3
+                    ≈ 39.9 GiB
+```
+
+So a reasonable first estimate for that workload is:
+
+- about `13 GiB` of logical Loki retained data, and
+- about `40 GiB` of physical Garage storage consumed
+
+If the same `10` servers are noisier, for example `50` lines/sec/server at
+`300` bytes/line, the same equation yields roughly:
+
+- `12.1 GiB/day` raw ingest
+- `79.9 GiB` logical retained data at `30` days
+- `240 GiB` physical Garage storage at replication `3`
+
+Practical recommendation:
+
+- set `retention-period` explicitly, for example `14`, `30`, or `60`
+- the default `14` days is only a guardrail, not a sizing recommendation for
+  every environment
+- do not set `retention-period=0` unless unbounded growth is intentional
+- size Garage storage for retained data multiplied by the Garage replication
+  factor
+
+Example with explicit retention:
+
+```bash
+juju config loki-vm retention-period=30
+```
+
+This is primarily a safety control to avoid exhausting available disk/object
+storage over time.
 
 ### Ingestion endpoint publishing
 
