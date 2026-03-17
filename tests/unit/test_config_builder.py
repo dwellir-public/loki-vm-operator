@@ -16,6 +16,8 @@ def test_config_builder_basic_fields():
 
     assert config["auth_enabled"] is False
     assert config["common"]["path_prefix"] == DEFAULT_DATA_DIR
+    assert config["common"]["storage"]["filesystem"]["chunks_directory"].endswith("chunks")
+    assert config["common"]["storage"]["filesystem"]["rules_directory"].endswith("rules")
     assert config["storage_config"]["filesystem"]["directory"].endswith("chunks")
 
 

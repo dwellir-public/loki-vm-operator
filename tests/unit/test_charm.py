@@ -316,6 +316,41 @@ def test_external_url_updates_grafana_source(monkeypatch: pytest.MonkeyPatch):
     assert captured["source_url"] == "http://logs.example.com:3100"
 
 
+def test_ipv6_unit_address_is_bracketed_in_published_urls(monkeypatch: pytest.MonkeyPatch):
+    """Wrap IPv6 literal unit addresses before publishing direct HTTP endpoints."""
+    ctx = _context()
+    captured = {}
+
+    def mock_update_endpoint(self, url: str = "", relation=None):
+        captured["push_url"] = url
+
+    def mock_update_source(self, source_url: str = ""):
+        captured["source_url"] = source_url
+
+    monkeypatch.setattr("charm.LokiPushApiProvider.update_endpoint", mock_update_endpoint)
+    monkeypatch.setattr("charm.GrafanaSourceProvider.update_source", mock_update_source)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._instance_addr",
+        lambda *_: "2001:db8:1234:1:216:3eff:fed2:e559",
+    )
+
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "",
+    }
+
+    ctx.run(ctx.on.config_changed(), testing.State(config=config))
+
+    assert captured["push_url"] == "http://[2001:db8:1234:1:216:3eff:fed2:e559]:3100"
+    assert captured["source_url"] == "http://[2001:db8:1234:1:216:3eff:fed2:e559]:3100"
+
+
 def test_external_url_non_leader_clears_grafana_source(monkeypatch: pytest.MonkeyPatch):
     """Ensure non-leaders clear their grafana-source endpoint when external-url is set."""
     ctx = _context()

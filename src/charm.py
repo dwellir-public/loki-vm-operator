@@ -588,7 +588,7 @@ class LokiVmCharm(ops.CharmBase):
             return self._normalize_external_url(external)
         if ingress_url := self._ingress_url():
             return ingress_url.rstrip("/")
-        addr = self._instance_addr()
+        addr = self._format_host_for_url(self._instance_addr())
         return f"http://{addr}:3100"
 
     def _external_url_configured(self) -> bool:
@@ -618,6 +618,12 @@ class LokiVmCharm(ops.CharmBase):
         if ":" not in netloc:
             netloc = f"{netloc}:3100"
         return f"{scheme}://{netloc}{path}".rstrip("/")
+
+    def _format_host_for_url(self, host: str) -> str:
+        """Return a host suitable for inclusion in an HTTP URL."""
+        if ":" in host and not host.startswith("["):
+            return f"[{host}]"
+        return host
 
     def _ingress_url(self) -> str | None:
         """Return the ingress URL for this unit when available."""

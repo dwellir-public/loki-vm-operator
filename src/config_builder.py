@@ -130,7 +130,7 @@ class ConfigBuilder:
                     "chunks_directory": self.chunks_dir,
                     "rules_directory": self.rules_dir,
                 }
-            },
+            }
         return common
 
     @property
