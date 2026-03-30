@@ -71,7 +71,7 @@ juju exec --unit loki-vm/0 -- bash -lc 'end=$(date +%s%N); start=$((end-5*60*100
 Supported relations:
 - `replicas` (peers) for clustering
 - `ingress` (ingress_per_unit)
-- `s3` (requires) for Garage-backed object storage
+- `s3` (requires) for upstream S3 provider contracts
 - `loki_push_api` (provides Loki push endpoint)
 
 ## 3-node cluster behavior
@@ -83,12 +83,21 @@ intend to ingest to multiple units.
 
 ### Object storage behavior
 
-`loki-vm` now supports the `garage-vm:s3` relation.
+`loki-vm` now supports the Canonical `s3` integration pattern based on
+`object-storage-charmlib`.
 
 - Without an `s3` relation, single-unit Loki stays on the local filesystem.
 - With an `s3` relation, Loki switches to TSDB single-store on S3.
 - Multi-unit clustered Loki now waits for `s3` before claiming it is fully
   configured.
+- Validated providers are:
+  - `garage-vm:s3`
+  - `s3-integrator:s3-credentials` track `2`
+
+In other words, `loki-vm` is compatible with the same
+`object-storage-charmlib` relation contract used by Canonical's
+`s3-integrator` track `2`. The charm does not require a Garage-specific schema
+or any custom S3 shim.
 
 Local disk is still used for:
 
@@ -111,6 +120,22 @@ juju deploy ./garage-vm_ubuntu@24.04-amd64.charm garage-vm --num-units 3 --confi
 juju deploy ./loki-vm_ubuntu-24.04-amd64.charm loki-vm --num-units 3 --storage loki-persisted=rootfs,2G --config retention-period=30
 juju integrate loki-vm:s3 garage-vm:s3
 ```
+
+Example deployment with Canonical `s3-integrator` track `2`:
+
+```bash
+juju deploy s3-integrator --channel=2/edge
+juju deploy ./loki-vm_ubuntu-24.04-amd64.charm loki-vm --num-units 1 --storage loki-persisted=rootfs,2G
+juju config s3-integrator endpoint=http://10.232.126.109 region=us-east-1 bucket=mybucket s3-uri-style=path
+juju add-secret s3-creds access-key=<ACCESS_KEY> secret-key=<SECRET_KEY>
+juju grant-secret s3-creds s3-integrator
+juju config s3-integrator credentials=secret:<secret-id>
+juju integrate s3-integrator:s3-credentials loki-vm:s3
+```
+
+For plain HTTP S3 endpoints such as MicroCeph RGW in local test environments,
+keep the endpoint scheme as `http://...`; `loki-vm` will normalize the endpoint
+and render `insecure: true` automatically.
 
 Set `retention-period` deliberately for any deployment that is meant to run for
 longer than short-lived testing. The charm now defaults to `14` days as a guard

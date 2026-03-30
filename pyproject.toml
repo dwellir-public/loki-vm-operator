@@ -14,6 +14,7 @@ dependencies = [
     "PyYAML",
     "cosl",
     "jsonschema", # charms.traefik_k8s.v1.ingress_per_unit
+    "object-storage-charmlib",
 ]
 
 [dependency-groups]

@@ -45,29 +45,23 @@ def mock_get_version():
     return "1.0.0"
 
 
-class _FakeSecret:
-    def get_content(self, *, refresh: bool = False):  # noqa: ARG002
-        return {"secret-key": "very-secret"}
-
-
 def _s3_relation(
     *,
     endpoint: str = "http://10.0.0.10:3900",
-    tls: str = "false",
-    insecure: str = "true",
+    path: str = "",
+    remote_app_name: str = "s3-integrator",
 ) -> testing.Relation:
     return testing.Relation(
         "s3",
         interface="s3",
-        remote_app_name="garage-vm",
+        remote_app_name=remote_app_name,
         remote_app_data={
             "endpoint": endpoint,
             "bucket": "juju-s3-rel-10",
             "access-key": "access",
-            "secret-key-secret-id": "secret:relation-10",
+            "secret-key": "very-secret",
             "region": "garage",
-            "tls": tls,
-            "insecure": insecure,
+            "path": path,
         },
     )
 
@@ -430,8 +424,6 @@ def test_s3_relation_renders_garage_backed_config(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
     monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
-    monkeypatch.setattr("charm.ops.Model.get_secret", lambda *_args, **_kwargs: _FakeSecret())
-
     state_out = ctx.run(
         ctx.on.config_changed(),
         testing.State(relations=[_s3_relation()], planned_units=1),
@@ -450,6 +442,34 @@ def test_s3_relation_renders_garage_backed_config(monkeypatch: pytest.MonkeyPatc
     assert isinstance(state_out.unit_status, testing.ActiveStatus)
 
 
+@pytest.mark.parametrize("provider_name", ["garage-vm", "s3-integrator"])
+def test_s3_provider_parity(monkeypatch: pytest.MonkeyPatch, provider_name: str):
+    """Either provider should render the same S3-backed Loki config."""
+    ctx = _context()
+    seen = {}
+
+    def mock_write_config_text(config_text: str, **_):
+        seen["config"] = config_text
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(relations=[_s3_relation(remote_app_name=provider_name)], planned_units=1),
+    )
+
+    rendered = "\n".join(
+        line for line in seen["config"].splitlines() if not line.startswith("#")
+    )
+    config_yaml = yaml.safe_load(rendered)
+
+    assert config_yaml["schema_config"]["configs"][0]["object_store"] == "s3"
+    assert config_yaml["storage_config"]["aws"]["endpoint"] == "10.0.0.10:3900"
+    assert config_yaml["storage_config"]["aws"]["bucketnames"] == "juju-s3-rel-10"
+    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+
 def test_s3_relation_with_retention_uses_s3_delete_store(monkeypatch: pytest.MonkeyPatch):
     """Retention in S3 mode should use S3 for delete requests."""
     ctx = _context()
@@ -460,8 +480,6 @@ def test_s3_relation_with_retention_uses_s3_delete_store(monkeypatch: pytest.Mon
 
     monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
     monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
-    monkeypatch.setattr("charm.ops.Model.get_secret", lambda *_args, **_kwargs: _FakeSecret())
-
     ctx.run(
         ctx.on.config_changed(),
         testing.State(
@@ -484,7 +502,7 @@ def test_incomplete_s3_relation_waits(monkeypatch: pytest.MonkeyPatch):
     relation = testing.Relation(
         "s3",
         interface="s3",
-        remote_app_name="garage-vm",
+        remote_app_name="s3-integrator",
         remote_app_data={"endpoint": "http://10.0.0.10:3900"},
     )
 
@@ -495,3 +513,20 @@ def test_incomplete_s3_relation_waits(monkeypatch: pytest.MonkeyPatch):
 
     assert isinstance(state_out.unit_status, testing.WaitingStatus)
     assert state_out.unit_status.message == "waiting for complete s3 relation data"
+
+
+def test_s3_relation_with_path_blocks(monkeypatch: pytest.MonkeyPatch):
+    """A provider path is currently unsupported and should block explicitly."""
+    ctx = _context()
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(relations=[_s3_relation(path="prefix")]),
+    )
+
+    assert state_out.unit_status == testing.BlockedStatus(
+        "s3 relation field 'path' is not supported"
+    )

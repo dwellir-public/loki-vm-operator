@@ -55,8 +55,8 @@ requires:
     optional: true
     limit: 1
     description: |
-      Consume S3 credentials and endpoint information from garage-vm for Loki TSDB
-      object storage.
+      Consume S3 credentials and endpoint information from an S3 provider charm for
+      Loki TSDB object storage.
 
 peers:
   replicas:

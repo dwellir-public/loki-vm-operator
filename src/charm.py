@@ -18,6 +18,7 @@ from charms.grafana_k8s.v0.grafana_source import GrafanaSourceData, GrafanaSourc
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
 from charms.traefik_k8s.v1.ingress_per_unit import IngressPerUnitRequirer
 from cosl.interfaces.datasource_exchange import DatasourceDict, DatasourceExchange
+from object_storage import S3Requirer
 
 # A standalone module for workload-specific logic (no charming concerns):
 import loki
@@ -84,14 +85,22 @@ class LokiVmCharm(ops.CharmBase):
             provider_endpoint="send-datasource",
             requirer_endpoint=None,
         )
+        self.s3_client = S3Requirer(self, relation_name="s3")
         framework.observe(self.on.install, self._on_install)
         framework.observe(self.on.start, self._on_start)
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
         framework.observe(self.on.update_status, self._on_update_status)
-        framework.observe(self.on.secret_changed, self._on_secret_changed)
         framework.observe(self.ingress.on.ready_for_unit, self._on_ingress_changed)
         framework.observe(self.ingress.on.revoked_for_unit, self._on_ingress_changed)
+        framework.observe(
+            self.s3_client.on.storage_connection_info_changed,
+            self._on_s3_changed,
+        )
+        framework.observe(
+            self.s3_client.on.storage_connection_info_gone,
+            self._on_s3_changed,
+        )
         framework.observe(
             self.on.send_datasource_relation_changed,
             self._on_grafana_source_changed,
@@ -202,15 +211,6 @@ class LokiVmCharm(ops.CharmBase):
     def _on_s3_changed(self, event: ops.EventBase) -> None:
         """Handle S3 relation changes and reconfigure storage."""
         self._reconcile_runtime(status_message="updating storage configuration")
-
-    def _on_secret_changed(self, event: ops.SecretChangedEvent) -> None:
-        """Reconcile when an observed secret backing S3 credentials changes."""
-        relation = self.model.get_relation("s3")
-        if relation is None or relation.app is None:
-            return
-        secret_id = relation.data[relation.app].get("secret-key-secret-id", "").strip()
-        if secret_id and secret_id == event.secret.id:
-            self._reconcile_runtime(status_message="updating storage credentials")
 
     def _on_loki_persisted_storage_attached(self, event: ops.StorageAttachedEvent) -> None:
         """Update data dir when loki-persisted storage is attached."""
@@ -409,9 +409,7 @@ class LokiVmCharm(ops.CharmBase):
     def _active_status(self) -> ops.ActiveStatus:
         """Return the steady-state active status message."""
         if self._storage_backend_state().s3 is not None:
-            return ops.ActiveStatus(
-                "Loki configuration updated and validated (Garage S3 backend)."
-            )
+            return ops.ActiveStatus("Loki configuration updated and validated (S3 backend).")
         return ops.ActiveStatus("Loki configuration updated and validated.")
 
     def _is_drift_status(self) -> bool:
@@ -472,11 +470,6 @@ class LokiVmCharm(ops.CharmBase):
 
         try:
             s3 = self._s3_relation_details()
-        except ops.SecretNotFoundError:
-            return StorageBackendState(
-                status=ops.WaitingStatus("waiting for s3 credentials"),
-                s3=None,
-            )
         except InvalidConfigurationError as exc:
             return StorageBackendState(status=ops.BlockedStatus(str(exc)), s3=None)
 
@@ -490,26 +483,24 @@ class LokiVmCharm(ops.CharmBase):
     def _s3_relation_details(self) -> S3StorageConfig | None:
         """Return relation-provided S3 configuration when available."""
         relation = self.model.get_relation("s3")
-        if relation is None or relation.app is None:
+        if relation is None:
             return None
-        app_data = relation.data[relation.app]
-        required = ("endpoint", "bucket", "access-key", "secret-key-secret-id", "region")
-        if any(not app_data.get(field, "").strip() for field in required):
+        app_data = self.s3_client.get_storage_connection_info(relation)
+        required = ("endpoint", "bucket", "access-key", "secret-key", "region")
+        if any(not str(app_data.get(field, "")).strip() for field in required):
             return None
-
-        secret = self.model.get_secret(id=app_data["secret-key-secret-id"].strip())
-        content = secret.get_content(refresh=True)
-        secret_key = content.get("secret-key", "").strip()
-        if not secret_key:
-            return None
+        path = str(app_data.get("path", "")).strip()
+        if path:
+            raise InvalidConfigurationError("s3 relation field 'path' is not supported")
+        secret_key = str(app_data["secret-key"]).strip()
 
         return S3StorageConfig(
-            bucket=app_data["bucket"].strip(),
-            endpoint=self._normalize_s3_endpoint(app_data["endpoint"]),
-            access_key_id=app_data["access-key"].strip(),
+            bucket=str(app_data["bucket"]).strip(),
+            endpoint=self._normalize_s3_endpoint(str(app_data["endpoint"])),
+            access_key_id=str(app_data["access-key"]).strip(),
             secret_access_key=secret_key,
-            region=app_data["region"].strip(),
-            insecure=self._s3_is_insecure(app_data),
+            region=str(app_data["region"]).strip(),
+            insecure=self._s3_is_insecure(str(app_data["endpoint"])),
         )
 
     def _normalize_s3_endpoint(self, value: str) -> str:
@@ -522,18 +513,9 @@ class LokiVmCharm(ops.CharmBase):
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         return f"{host}:{port}"
 
-    def _s3_is_insecure(self, app_data: ops.RelationDataContent) -> bool:
+    def _s3_is_insecure(self, endpoint: str) -> bool:
         """Infer whether the S3 endpoint should use HTTP."""
-        endpoint = app_data["endpoint"].strip().lower()
-        if endpoint.startswith("http://"):
-            return True
-        insecure = app_data.get("insecure", "").strip()
-        if insecure:
-            return self._parse_bool(insecure, field_name="insecure")
-        tls = app_data.get("tls", "").strip()
-        if tls:
-            return not self._parse_bool(tls, field_name="tls")
-        return False
+        return endpoint.strip().lower().startswith("http://")
 
     def _parse_bool(self, value: str, *, field_name: str) -> bool:
         """Parse a boolean relation field."""
