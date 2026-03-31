@@ -1,13 +1,3 @@
-<!--
-Avoid using this README file for information that is maintained or published elsewhere, e.g.:
-
-* charmcraft.yaml > published on Charmhub
-* documentation > published on (or linked to from) Charmhub
-* detailed contribution guide > documentation or CONTRIBUTING.md
-
-Use links instead.
--->
-
 # loki-vm
 
 Charmhub package name: loki-vm
@@ -136,6 +126,73 @@ juju integrate s3-integrator:s3-credentials loki-vm:s3
 For plain HTTP S3 endpoints such as MicroCeph RGW in local test environments,
 keep the endpoint scheme as `http://...`; `loki-vm` will normalize the endpoint
 and render `insecure: true` automatically.
+
+### Example provider switch: `garage-vm` to Ceph RGW via `s3-integrator`
+
+The validated operator pattern is:
+
+- create one RW S3 account on the external provider
+- create one bucket per workload
+- deploy one `s3-integrator` app per bucket in the same Juju model as the consumer
+- switch relations one consumer at a time
+
+Concrete example using:
+
+- Ceph RGW running on the `admin/lxd-hosts` model hosts `192.168.243.250-252`
+- `loki-vm` running in model `erik-lonroth@external/observability1`
+- bucket `observability1-loki`
+- shared RW account also used by Mimir
+
+Create the RGW user and bucket on `singapore-admin1`:
+
+```bash
+ssh dwellir@192.168.243.250
+sudo ./cephadm shell -- radosgw-admin user create --uid observability1-s3 --display-name "observability1 S3"
+sudo ./cephadm shell -- radosgw-admin user info --uid observability1-s3
+export AWS_ACCESS_KEY_ID='<ACCESS_KEY>'
+export AWS_SECRET_ACCESS_KEY='<SECRET_KEY>'
+export AWS_DEFAULT_REGION='us-east-1'
+export S3_ENDPOINT='http://192.168.243.250:8081'
+aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket observability1-loki
+```
+
+Deploy and configure the Loki-specific `s3-integrator` in the consumer model:
+
+```bash
+juju deploy -m erik-lonroth@external/observability1 s3-integrator loki-s3 --channel 2/edge
+juju add-secret -m erik-lonroth@external/observability1 ceph-rgw-observability1 access-key='<ACCESS_KEY>' secret-key='<SECRET_KEY>'
+juju grant-secret -m erik-lonroth@external/observability1 ceph-rgw-observability1 loki-s3
+juju config -m erik-lonroth@external/observability1 loki-s3 \
+  endpoint='http://192.168.243.250:8081' \
+  bucket='observability1-loki' \
+  credentials='secret:<secret-id>' \
+  s3-uri-style='path' \
+  s3-api-version='4' \
+  region='us-east-1'
+```
+
+Cut over Loki from `garage-vm` to the new provider:
+
+```bash
+juju remove-relation -m erik-lonroth@external/observability1 garage-vm:s3 loki-vm:s3
+juju integrate -m erik-lonroth@external/observability1 loki-s3:s3-credentials loki-vm:s3
+```
+
+Verify:
+
+```bash
+juju status -m erik-lonroth@external/observability1 loki-s3 loki-vm
+juju ssh -m erik-lonroth@external/observability1 loki-vm/0 'sudo grep -n "observability1-loki\|192.168.243.250:8081" /etc/loki/config.yml'
+```
+
+Then run a normal Loki push/query smoke test through `loki-loadbalancer-vm`.
+
+Operational notes:
+
+- deploy `s3-integrator` in the same model as `loki-vm`; the external Ceph cluster does not need to be in the same Juju model
+- use `s3-uri-style=path` for IP-based RGW endpoints
+- for production, prefer a load balancer or VIP in front of the three RGW daemons instead of pointing at a single node IP
+- switching providers can cause transient WAL flush errors while the old credentials are being revoked; this is expected during the cutover window
 
 Set `retention-period` deliberately for any deployment that is meant to run for
 longer than short-lived testing. The charm now defaults to `14` days as a guard
