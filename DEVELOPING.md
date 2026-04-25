@@ -48,6 +48,13 @@ To focus on `loki.py` tests:
 uv run pytest -k loki
 ```
 
+Clustered restart contract:
+
+- Multi-unit `loki-vm` config changes must preserve rolling restart behavior.
+- The charm is expected to restart one clustered unit at a time after config changes.
+- Progress must be gated on workload and cluster health before advancing to the next unit.
+- Tests that would reintroduce concurrent clustered restarts should be treated as regressions.
+
 ### Integration tests
 
 Integration tests use Jubilant and require:

@@ -57,6 +57,87 @@ def test_verify_config_invokes_loki(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     assert seen["timeout"] == 12
 
 
+def test_check_ready_returns_true_for_ready_response(monkeypatch: pytest.MonkeyPatch):
+    class _Response:
+        status = 200
+
+        def read(self):
+            return b"ready"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(loki.request, "urlopen", lambda *args, **kwargs: _Response())
+
+    ready, error = loki.check_ready("http://localhost:3100")
+
+    assert ready is True
+    assert error is None
+
+
+def test_check_ready_returns_error_for_non_ready_response(monkeypatch: pytest.MonkeyPatch):
+    class _Response:
+        status = 503
+
+        def read(self):
+            return b"not ready"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(loki.request, "urlopen", lambda *args, **kwargs: _Response())
+
+    ready, error = loki.check_ready("http://localhost:3100")
+
+    assert ready is False
+    assert error == "HTTP 503: not ready"
+
+
+def test_check_endpoint_returns_true_for_2xx_response(monkeypatch: pytest.MonkeyPatch):
+    class _Response:
+        status = 204
+
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(loki.request, "urlopen", lambda *args, **kwargs: _Response())
+
+    ready, error = loki.check_endpoint("http://example:9000")
+
+    assert ready is True
+    assert error is None
+
+
+def test_check_endpoint_returns_error_for_http_error(monkeypatch: pytest.MonkeyPatch):
+    def _raise(*args, **kwargs):
+        raise loki.error.HTTPError(
+            url="http://example:9000",
+            code=503,
+            msg="Service Unavailable",
+            hdrs=None,
+            fp=None,
+        )
+
+    monkeypatch.setattr(loki.request, "urlopen", _raise)
+
+    ready, error = loki.check_endpoint("http://example:9000")
+
+    assert ready is False
+    assert error == "HTTP 503: Service Unavailable"
+
+
 def test_ensure_data_dir_symlink_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     default_dir = tmp_path / "default"
     target_dir = tmp_path / "target"

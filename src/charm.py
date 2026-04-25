@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,6 +35,10 @@ from config_builder import (
 
 logger = logging.getLogger(__name__)
 
+RESTART_PENDING_KEY = "restart-pending"
+RESTART_TARGET_KEY = "restart-target"
+ROLLING_PHASE_KEY = "rolling-phase"
+
 
 class InvalidConfigurationError(RuntimeError):
     """Raised when charm configuration or relation data is invalid."""
@@ -44,6 +50,30 @@ class StorageBackendState:
 
     status: ops.StatusBase | None
     s3: S3StorageConfig | None
+
+
+@dataclass(frozen=True)
+class ClusterMemberHealth:
+    """Readiness status for one Loki unit in the cluster."""
+
+    unit_name: str
+    address: str | None
+    ready: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ClusterHealth:
+    """Aggregated readiness status for the Loki deployment."""
+
+    expected_units: int
+    ready_units: int
+    members: list[ClusterMemberHealth]
+
+    @property
+    def healthy(self) -> bool:
+        """Return whether every expected unit is ready."""
+        return self.ready_units == self.expected_units
 
 
 class LokiVmCharm(ops.CharmBase):
@@ -59,6 +89,7 @@ class LokiVmCharm(ops.CharmBase):
             last_good_config="",
             last_failed_config_path="",
             config_drifted=False,
+            peer_addresses_json="",
         )
         self.ingress = IngressPerUnitRequirer(
             self,
@@ -91,6 +122,7 @@ class LokiVmCharm(ops.CharmBase):
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
         framework.observe(self.on.update_status, self._on_update_status)
+        framework.observe(self.on.cluster_health_action, self._on_cluster_health_action)
         framework.observe(self.ingress.on.ready_for_unit, self._on_ingress_changed)
         framework.observe(self.ingress.on.revoked_for_unit, self._on_ingress_changed)
         framework.observe(
@@ -166,7 +198,7 @@ class LokiVmCharm(ops.CharmBase):
         if version is not None:
             self.unit.set_workload_version(version)
         self._update_datasource_exchange()
-        self.unit.status = self._active_status()
+        self.unit.status = self._runtime_health_status()
 
     def _on_config_changed(self, event: ops.ConfigChangedEvent) -> None:
         """Re-render and apply configuration when charm config changes."""
@@ -186,8 +218,9 @@ class LokiVmCharm(ops.CharmBase):
             self.unit.status = ops.MaintenanceStatus("Loki service not running")
             return
         self._reconcile_config_drift_status()
-        if self._is_service_down_status() and not self._stored.config_drifted:
-            self.unit.status = self._active_status()
+        if not self._stored.config_drifted:
+            self._reconcile_rolling_restart()
+            self.unit.status = self._runtime_health_status()
 
     def _on_ingress_changed(self, event: ops.EventBase) -> None:
         """Handle ingress updates by refreshing the published endpoint."""
@@ -206,11 +239,43 @@ class LokiVmCharm(ops.CharmBase):
         """Handle peer relation changes and reconfigure memberlist joins."""
         if event.relation:
             event.relation.data[self.unit]["address"] = self._instance_addr()
-        self._reconcile_runtime(status_message="updating cluster configuration")
+        current_addresses = self._peer_addresses_json()
+        if current_addresses != self._stored.peer_addresses_json:
+            self._stored.peer_addresses_json = current_addresses
+            self._reconcile_runtime(status_message="updating cluster configuration")
+            return
+        self._fast_reconcile_rolling_restart()
 
     def _on_s3_changed(self, event: ops.EventBase) -> None:
         """Handle S3 relation changes and reconfigure storage."""
         self._reconcile_runtime(status_message="updating storage configuration")
+
+    def _on_cluster_health_action(self, event: ops.ActionEvent) -> None:
+        """Report compact cluster health plus detailed member readiness."""
+        storage_state = self._storage_backend_state()
+        cluster_health = self._cluster_health()
+        storage_ok, storage_error = self._storage_probe_result(storage_state)
+        event.set_results(
+            {
+                "healthy": storage_state.status is None and storage_ok and cluster_health.healthy,
+                "summary": self._health_summary(cluster_health),
+                "ready-units": cluster_health.ready_units,
+                "expected-units": cluster_health.expected_units,
+                "storage": self._storage_status_label(storage_state),
+                "storage-error": storage_error,
+                "members": json.dumps(
+                    [
+                        {
+                            "unit": member.unit_name,
+                            "address": member.address,
+                            "ready": member.ready,
+                            "error": member.error,
+                        }
+                        for member in cluster_health.members
+                    ]
+                ),
+            }
+        )
 
     def _on_loki_persisted_storage_attached(self, event: ops.StorageAttachedEvent) -> None:
         """Update data dir when loki-persisted storage is attached."""
@@ -250,10 +315,28 @@ class LokiVmCharm(ops.CharmBase):
             self.unit.status = self._invalid_config_status()
             return
         if config_changed:
-            self._restart_if_running()
+            if self._is_clustered_mode():
+                self._set_restart_pending(True)
+            else:
+                self._restart_if_running()
+        self._reconcile_rolling_restart()
         self._set_workload_version()
         self._update_datasource_exchange()
-        self.unit.status = self._active_status()
+        self.unit.status = self._runtime_health_status()
+
+    def _fast_reconcile_rolling_restart(self) -> None:
+        """Advance rolling restart state without rewriting config."""
+        storage_state = self._storage_backend_state()
+        if storage_state.status is not None:
+            self.unit.status = storage_state.status
+            return
+        if not loki.is_active():
+            self.unit.status = ops.MaintenanceStatus("Loki service not running")
+            return
+        if self._stored.config_drifted:
+            return
+        self._reconcile_rolling_restart()
+        self.unit.status = self._runtime_health_status()
 
     def _configure(self) -> tuple[bool, bool]:
         """Render, validate, and persist Loki configuration.
@@ -406,11 +489,251 @@ class LokiVmCharm(ops.CharmBase):
         """Return the Maintenance status message for config drift."""
         return f"Manual Loki config change detected at {DEFAULT_CONFIG_PATH}"
 
-    def _active_status(self) -> ops.ActiveStatus:
-        """Return the steady-state active status message."""
-        if self._storage_backend_state().s3 is not None:
-            return ops.ActiveStatus("Loki configuration updated and validated (S3 backend).")
-        return ops.ActiveStatus("Loki configuration updated and validated.")
+    def _runtime_health_status(self) -> ops.StatusBase:
+        """Return compact runtime health for ready or degraded clusters."""
+        cluster_health = self._cluster_health()
+        if rolling_status := self._rolling_restart_status(cluster_health):
+            return rolling_status
+        summary = self._health_summary(cluster_health)
+        if cluster_health.healthy:
+            return ops.ActiveStatus(summary)
+        return ops.MaintenanceStatus(summary)
+
+    def _health_summary(self, cluster_health: ClusterHealth) -> str:
+        """Render the compact runtime health summary."""
+        return (
+            f"ready({cluster_health.ready_units}/{cluster_health.expected_units}), "
+            f"storage({self._storage_status_label(self._storage_backend_state())})"
+        )
+
+    def _storage_status_label(self, storage_state: StorageBackendState) -> str:
+        """Return a short storage health label."""
+        if storage_state.s3 is None and storage_state.status is None:
+            return "local"
+        if storage_state.s3 is not None and storage_state.status is None:
+            storage_ok, _ = self._storage_probe_result(storage_state)
+            return "s3(ok)" if storage_ok else "s3(error)"
+        if isinstance(storage_state.status, ops.WaitingStatus):
+            return "waiting"
+        if isinstance(storage_state.status, ops.BlockedStatus):
+            return "error"
+        return "unknown"
+
+    def _storage_probe_result(self, storage_state: StorageBackendState) -> tuple[bool, str | None]:
+        """Probe the configured storage backend when one is present."""
+        if storage_state.s3 is None:
+            return True, None
+        scheme = "http" if storage_state.s3.insecure else "https"
+        return loki.check_endpoint(f"{scheme}://{storage_state.s3.endpoint}")
+
+    def _rolling_phase(self, unit_name: str | None = None) -> str:
+        """Return the stored rolling-restart phase for a unit."""
+        relation = self._peer_relation()
+        if relation is None:
+            return ""
+        name = unit_name or self.unit.name
+        if name == self.unit.name:
+            return relation.data[self.unit].get(ROLLING_PHASE_KEY, "")
+        for unit in relation.units:
+            if unit.name == name:
+                return relation.data[unit].get(ROLLING_PHASE_KEY, "")
+        return ""
+
+    def _set_rolling_phase(self, phase: str) -> None:
+        """Persist the current rolling-restart phase for this unit."""
+        relation = self._peer_relation()
+        if relation is None:
+            return
+        if phase:
+            relation.data[self.unit][ROLLING_PHASE_KEY] = phase
+            return
+        relation.data[self.unit].pop(ROLLING_PHASE_KEY, None)
+
+    def _rolling_restart_status(self, cluster_health: ClusterHealth) -> ops.StatusBase | None:
+        """Return per-unit rolling-restart progress while a rollout is active."""
+        if not self._is_clustered_mode():
+            return None
+        target = self._restart_target()
+        pending_units = self._pending_restart_units()
+        if not target and not pending_units:
+            return None
+        phase = self._rolling_phase()
+        if target == self.unit.name and self._restart_pending(self.unit.name):
+            phase = phase or "restarting-self"
+        elif self._restart_pending(self.unit.name):
+            phase = "queued"
+        elif target:
+            phase = "waiting-peers"
+        else:
+            phase = "completed"
+        target_label = "self" if target == self.unit.name else (target or "-")
+        return ops.MaintenanceStatus(
+            f"rolling({phase}, target={target_label}), {self._health_summary(cluster_health)}"
+        )
+
+    def _is_clustered_mode(self) -> bool:
+        """Return whether restarts should be coordinated via the peer relation."""
+        return self.app.planned_units() > 1 and self._peer_relation() is not None
+
+    def _peer_relation(self) -> ops.Relation | None:
+        """Return the peer relation used for clustered restart coordination."""
+        return self.model.get_relation("replicas")
+
+    def _set_restart_pending(self, pending: bool) -> None:
+        """Persist whether this unit still requires a rolling restart."""
+        relation = self._peer_relation()
+        if relation is None:
+            return
+        relation.data[self.unit][RESTART_PENDING_KEY] = "true" if pending else "false"
+        if pending:
+            relation.data[self.unit].setdefault(ROLLING_PHASE_KEY, "queued")
+        else:
+            self._set_rolling_phase("")
+
+    def _restart_pending(self, unit_name: str) -> bool:
+        """Return whether the named unit still requires a coordinated restart."""
+        relation = self._peer_relation()
+        if relation is None:
+            return False
+        if unit_name == self.unit.name:
+            return relation.data[self.unit].get(RESTART_PENDING_KEY) == "true"
+        for unit in relation.units:
+            if unit.name == unit_name:
+                return relation.data[unit].get(RESTART_PENDING_KEY) == "true"
+        return False
+
+    def _pending_restart_units(self) -> list[str]:
+        """Return sorted unit names still pending restart."""
+        relation = self._peer_relation()
+        if relation is None:
+            return []
+        pending_units: list[str] = []
+        if relation.data[self.unit].get(RESTART_PENDING_KEY) == "true":
+            pending_units.append(self.unit.name)
+        for unit in relation.units:
+            if relation.data[unit].get(RESTART_PENDING_KEY) == "true":
+                pending_units.append(unit.name)
+        return sorted(set(pending_units), key=lambda name: (name == self.unit.name, name))
+
+    def _restart_target(self) -> str:
+        """Return the unit name currently selected for rolling restart."""
+        relation = self._peer_relation()
+        if relation is None:
+            return ""
+        return relation.data[self.app].get(RESTART_TARGET_KEY, "")
+
+    def _set_restart_target(self, unit_name: str) -> None:
+        """Persist the rolling-restart target in peer app data."""
+        relation = self._peer_relation()
+        if relation is None or not self._is_leader():
+            return
+        relation.data[self.app][RESTART_TARGET_KEY] = unit_name
+
+    def _reconcile_rolling_restart(self) -> None:
+        """Advance the rolling restart and execute the selected unit restart."""
+        if not self._is_clustered_mode():
+            return
+        if self._is_leader():
+            self._advance_rolling_restart()
+        if self._restart_target() == self.unit.name and self._restart_pending(self.unit.name):
+            self._perform_target_restart()
+
+    def _advance_rolling_restart(self) -> None:
+        """Select the next restart target when cluster health allows it."""
+        target = self._restart_target()
+        cluster_health = self._cluster_health()
+        pending_units = self._pending_restart_units()
+
+        if target:
+            if self._restart_pending(target):
+                return
+            if not cluster_health.healthy:
+                return
+            self._set_restart_target("")
+            target = ""
+
+        if not cluster_health.healthy or target or not pending_units:
+            return
+
+        self._set_restart_target(pending_units[0])
+
+    def _perform_target_restart(self) -> None:
+        """Gracefully restart the selected unit and clear its pending flag."""
+        self._set_rolling_phase("restarting-self")
+        self.unit.status = self._runtime_health_status()
+        try:
+            loki.prepare_shutdown(self._unit_base_url(self._instance_addr()))
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Skipping graceful shutdown preparation: %s", exc)
+        self._restart_if_running()
+        self._set_rolling_phase("waiting-ready")
+        self.unit.status = self._runtime_health_status()
+        self._wait_for_local_ready()
+        self._set_rolling_phase("waiting-cluster")
+        self.unit.status = self._runtime_health_status()
+        self._wait_for_cluster_healthy()
+        self._set_restart_pending(False)
+
+    def _wait_for_local_ready(self, *, timeout: int = 120) -> None:
+        """Wait until the local Loki unit reports ready after a restart."""
+        deadline = time.monotonic() + timeout
+        base_url = self._unit_base_url(self._instance_addr())
+        while time.monotonic() < deadline:
+            ready, _ = loki.check_ready(base_url)
+            if ready:
+                return
+            time.sleep(1)
+        raise RuntimeError(f"Timed out waiting for Loki readiness on {self.unit.name}")
+
+    def _wait_for_cluster_healthy(self, *, timeout: int = 120) -> None:
+        """Wait until the Loki cluster is healthy after a rolling restart step."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._cluster_health().healthy:
+                return
+            time.sleep(1)
+        raise RuntimeError(f"Timed out waiting for Loki cluster recovery on {self.unit.name}")
+
+    def _cluster_health(self) -> ClusterHealth:
+        """Probe local and peer readiness endpoints for cluster health."""
+        members: list[ClusterMemberHealth] = []
+        relation = self.model.get_relation("replicas")
+        remote_addresses = {
+            unit.name: relation.data[unit].get("address")
+            for unit in relation.units
+        } if relation is not None else {}
+        known_units = {self.unit.name, *remote_addresses.keys()}
+        ordered_units = sorted(
+            known_units,
+            key=lambda unit_name: int(unit_name.rsplit("/", 1)[1]),
+        )
+        expected_units = len(ordered_units)
+        for unit_name in ordered_units:
+            address = self._instance_addr() if unit_name == self.unit.name else remote_addresses.get(unit_name)
+            if not address:
+                members.append(
+                    ClusterMemberHealth(
+                        unit_name=unit_name,
+                        address=None,
+                        ready=False,
+                        error="missing address",
+                    )
+                )
+                continue
+            ready, error = loki.check_ready(self._unit_base_url(address))
+            members.append(
+                ClusterMemberHealth(
+                    unit_name=unit_name,
+                    address=address,
+                    ready=ready,
+                    error=error,
+                )
+            )
+        return ClusterHealth(
+            expected_units=expected_units,
+            ready_units=sum(member.ready for member in members),
+            members=members,
+        )
 
     def _is_drift_status(self) -> bool:
         """Return True if the unit is in the drift Maintenance status."""
@@ -456,6 +779,17 @@ class LokiVmCharm(ops.CharmBase):
             if addr and addr != self._instance_addr():
                 members.append(addr)
         return members
+
+    def _peer_addresses_json(self) -> str:
+        """Return a stable JSON snapshot of peer addresses for config drift checks."""
+        relation = self._peer_relation()
+        if relation is None:
+            return "[]"
+        addresses = sorted(
+            (unit.name, relation.data[unit].get("address", ""))
+            for unit in relation.units
+        )
+        return json.dumps(addresses)
 
     def _storage_backend_state(self) -> StorageBackendState:
         """Return the resolved storage backend and any blocking/waiting status."""
@@ -610,6 +944,10 @@ class LokiVmCharm(ops.CharmBase):
     def _ingress_url(self) -> str | None:
         """Return the ingress URL for this unit when available."""
         return self.ingress.url if self.ingress else None
+
+    def _unit_base_url(self, host: str) -> str:
+        """Return the direct base URL for a Loki unit address."""
+        return f"http://{self._format_host_for_url(host)}:3100"
 
     def _sorted_source_data(self) -> GrafanaSourceData:
         """Return deterministic Grafana source metadata for ruler link fields.

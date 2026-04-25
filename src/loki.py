@@ -16,6 +16,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Iterable
+from urllib import error, request
 
 import yaml
 import grp
@@ -323,6 +324,44 @@ def is_active(*, timeout: int = DEFAULT_STATUS_TIMEOUT) -> bool:
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
+
+
+def check_ready(base_url: str, *, timeout: int = DEFAULT_STATUS_TIMEOUT) -> tuple[bool, str | None]:
+    """Probe the Loki readiness endpoint and return `(ready, error)`."""
+    ready_url = f"{base_url.rstrip('/')}/ready"
+    return check_endpoint(ready_url, timeout=timeout, expected_body="ready")
+
+
+def check_endpoint(
+    url: str,
+    *,
+    timeout: int = DEFAULT_STATUS_TIMEOUT,
+    expected_body: str | None = None,
+) -> tuple[bool, str | None]:
+    """Probe an HTTP endpoint and return `(ready, error)`."""
+    try:
+        with request.urlopen(url, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace").strip()
+            if 200 <= response.status < 300 and (
+                expected_body is None or body.lower() == expected_body.lower()
+            ):
+                return True, None
+            return False, f"HTTP {response.status}: {body or 'unexpected response'}"
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        return False, f"HTTP {exc.code}: {body or exc.reason}"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
+def prepare_shutdown(base_url: str, *, timeout: int = DEFAULT_STATUS_TIMEOUT) -> None:
+    """Best-effort request to prepare Loki for graceful shutdown."""
+    request_obj = request.Request(
+        f"{base_url.rstrip('/')}/ingester/prepare_shutdown",
+        method="POST",
+    )
+    with request.urlopen(request_obj, timeout=timeout):
+        return
 
 
 def _write_file_atomic(path: Path, content: str) -> None:

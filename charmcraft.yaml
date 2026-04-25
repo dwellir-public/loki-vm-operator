@@ -62,6 +62,18 @@ peers:
   replicas:
     interface: loki_replica
 
+actions:
+  set-config:
+    description: Set a full config "$(base64 config.yaml) replacing the current and restarts the service.
+    params:
+      config:
+        description: The base64 encoded file content.
+        type: string
+    required:
+      - config
+  cluster-health:
+    description: Report Loki cluster readiness and storage health details.
+
 # (Optional) Configuration options for the charm
 # This config section defines charm config options, and populates the Configure
 # tab on Charmhub.

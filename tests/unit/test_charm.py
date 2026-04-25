@@ -3,6 +3,9 @@
 #
 # To learn more about testing, see https://documentation.ubuntu.com/ops/latest/explanation/testing/
 
+import json
+from types import SimpleNamespace
+
 import pytest
 import yaml
 from ops import testing
@@ -35,9 +38,18 @@ CONFIG_SPEC = {
     }
 }
 
+ACTIONS = {
+    "set-config": {
+        "description": "Set a full config",
+        "params": {"config": {"type": "string"}},
+        "required": ["config"],
+    },
+    "cluster-health": {"description": "Report Loki cluster health."},
+}
+
 
 def _context() -> testing.Context:
-    return testing.Context(LokiVmCharm, meta=META, config=CONFIG_SPEC)
+    return testing.Context(LokiVmCharm, meta=META, actions=ACTIONS, config=CONFIG_SPEC)
 
 
 def mock_get_version():
@@ -72,6 +84,7 @@ def _mock_workload_calls(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("charm.loki.get_version", lambda: None)
     monkeypatch.setattr("charm.loki.start", lambda: None)
     monkeypatch.setattr("charm.loki.restart", lambda: None)
+    monkeypatch.setattr("charm.loki.check_ready", lambda *_, **__: (True, None), raising=False)
 
 
 def test_start(monkeypatch: pytest.MonkeyPatch):
@@ -87,7 +100,7 @@ def test_start(monkeypatch: pytest.MonkeyPatch):
     state_out = ctx.run(ctx.on.start(), testing.State())
     # Assert:
     assert state_out.workload_version is not None
-    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+    assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
 
 
 def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
@@ -112,7 +125,7 @@ def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
     state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
 
     assert "auth_enabled: false" in seen["config"]
-    assert isinstance(state_out.unit_status, testing.ActiveStatus)
+    assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
 
 
 
@@ -185,6 +198,357 @@ def test_config_drift_sets_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path
     state_out = ctx.run(ctx.on.update_status(), state_out)
 
     assert isinstance(state_out.unit_status, testing.MaintenanceStatus)
+
+
+def test_update_status_surfaces_unhealthy_cluster(monkeypatch: pytest.MonkeyPatch):
+    """Use a compact maintenance message when the cluster is degraded."""
+    ctx = _context()
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: SimpleNamespace(healthy=False, ready_units=2, expected_units=3, members=[]),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    state_out = ctx.run(
+        ctx.on.update_status(),
+        testing.State(planned_units=3, relations=[_s3_relation()]),
+    )
+
+    assert state_out.unit_status == testing.MaintenanceStatus("ready(2/3), storage(s3(ok))")
+
+
+def test_update_status_surfaces_rolling_restart_for_queued_unit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A pending non-target unit should show queued rolling progress."""
+    ctx = _context()
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        local_app_data={"restart-target": "loki-vm/1"},
+        local_unit_data={"restart-pending": "true", "rolling-phase": "queued"},
+        peers_data={1: {"address": "10.0.0.2", "restart-pending": "true"}},
+    )
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: SimpleNamespace(healthy=False, ready_units=1, expected_units=2, members=[]),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    state_out = ctx.run(
+        ctx.on.update_status(),
+        testing.State(planned_units=2, relations=[relation, _s3_relation()]),
+    )
+
+    assert state_out.unit_status == testing.MaintenanceStatus(
+        "rolling(queued, target=loki-vm/1), ready(1/2), storage(s3(ok))"
+    )
+
+
+def test_update_status_surfaces_rolling_restart_for_completed_unit(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A unit that has finished should still show rollout progress until peers finish."""
+    ctx = _context()
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        local_app_data={"restart-target": "loki-vm/1"},
+        local_unit_data={"restart-pending": "false"},
+        peers_data={1: {"address": "10.0.0.2", "restart-pending": "true"}},
+    )
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: SimpleNamespace(healthy=False, ready_units=1, expected_units=2, members=[]),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    state_out = ctx.run(
+        ctx.on.update_status(),
+        testing.State(planned_units=2, relations=[relation, _s3_relation()]),
+    )
+
+    assert state_out.unit_status == testing.MaintenanceStatus(
+        "rolling(waiting-peers, target=loki-vm/1), ready(1/2), storage(s3(ok))"
+    )
+
+
+def test_cluster_health_action_reports_detailed_results(monkeypatch: pytest.MonkeyPatch):
+    """Expose the same health summary plus detailed member results via action output."""
+    ctx = _context()
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: SimpleNamespace(
+            healthy=False,
+            ready_units=2,
+            expected_units=3,
+            members=[
+                SimpleNamespace(unit_name="loki-vm/0", address="10.0.0.1", ready=True, error=None),
+                SimpleNamespace(unit_name="loki-vm/1", address="10.0.0.2", ready=True, error=None),
+                SimpleNamespace(
+                    unit_name="loki-vm/2",
+                    address="10.0.0.3",
+                    ready=False,
+                    error="timed out",
+                ),
+            ],
+        ),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    ctx.run(
+        ctx.on.action("cluster-health"),
+        testing.State(planned_units=3, relations=[_s3_relation()]),
+    )
+
+    assert ctx.action_results == {
+        "healthy": False,
+        "summary": "ready(2/3), storage(s3(ok))",
+        "ready-units": 2,
+        "expected-units": 3,
+        "storage": "s3(ok)",
+        "storage-error": None,
+        "members": json.dumps(
+            [
+                {"unit": "loki-vm/0", "address": "10.0.0.1", "ready": True, "error": None},
+                {"unit": "loki-vm/1", "address": "10.0.0.2", "ready": True, "error": None},
+                {"unit": "loki-vm/2", "address": "10.0.0.3", "ready": False, "error": "timed out"},
+            ]
+        ),
+    }
+
+
+def test_cluster_health_action_reports_s3_probe_failures(monkeypatch: pytest.MonkeyPatch):
+    """Surface S3 backend probe failures in the compact storage label."""
+    ctx = _context()
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: SimpleNamespace(
+            healthy=True,
+            ready_units=3,
+            expected_units=3,
+            members=[],
+        ),
+    )
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._storage_probe_result",
+        lambda *_: (False, "timed out"),
+    )
+
+    ctx.run(
+        ctx.on.action("cluster-health"),
+        testing.State(planned_units=3, relations=[_s3_relation()]),
+    )
+
+    assert ctx.action_results["healthy"] is False
+    assert ctx.action_results["summary"] == "ready(3/3), storage(s3(error))"
+    assert ctx.action_results["storage"] == "s3(error)"
+    assert ctx.action_results["storage-error"] == "timed out"
+
+
+def test_cluster_health_uses_actual_unit_numbers_for_sparse_clusters(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Health accounting should use real unit ids, not dense 0..N numbering."""
+    ctx = _context()
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        peers_data={
+            3: {"address": "10.0.0.3"},
+            4: {"address": "10.0.0.4"},
+        },
+    )
+
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr("charm.loki.check_ready", lambda *_, **__: (True, None))
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+    monkeypatch.setattr("charm.LokiVmCharm._instance_addr", lambda *_: "10.0.0.1")
+
+    ctx.run(
+        ctx.on.action("cluster-health"),
+        testing.State(relations=[relation, _s3_relation()], planned_units=3),
+    )
+
+    assert ctx.action_results["healthy"] is True
+    assert ctx.action_results["summary"] == "ready(3/3), storage(s3(ok))"
+    assert json.loads(ctx.action_results["members"]) == [
+        {"unit": "loki-vm/0", "address": "10.0.0.1", "ready": True, "error": None},
+        {"unit": "loki-vm/3", "address": "10.0.0.3", "ready": True, "error": None},
+        {"unit": "loki-vm/4", "address": "10.0.0.4", "ready": True, "error": None},
+    ]
+
+
+def test_clustered_non_leader_config_change_defers_restart(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A non-leader clustered unit should not restart itself on config change."""
+    ctx = _context()
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        local_app_data={"restart-target": "loki-vm/1"},
+        peers_data={1: {"address": "10.0.0.2"}},
+    )
+    restart_calls = []
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr("charm.loki.restart", lambda: restart_calls.append("restart"))
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: SimpleNamespace(healthy=True, ready_units=2, expected_units=2, members=[]),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(leader=False, planned_units=2, relations=[relation, _s3_relation()]),
+    )
+
+    peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert restart_calls == []
+    assert peer_out.local_unit_data["restart-pending"] == "true"
+    assert peer_out.local_app_data["restart-target"] == "loki-vm/1"
+
+
+def test_target_unit_restarts_when_selected_by_leader(monkeypatch: pytest.MonkeyPatch):
+    """Only the selected unit should perform the clustered restart."""
+    ctx = _context()
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        local_app_data={"restart-target": "loki-vm/0"},
+        local_unit_data={"restart-pending": "true"},
+        peers_data={1: {"address": "10.0.0.2", "restart-pending": "false"}},
+    )
+    restart_calls = []
+    ready_checks = []
+    cluster_checks = []
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr("charm.loki.restart", lambda: restart_calls.append("restart"))
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr("charm.loki.prepare_shutdown", lambda *_, **__: None, raising=False)
+    monkeypatch.setattr(
+        "charm.loki.check_ready",
+        lambda *_, **__: (ready_checks.append("ready") or True, None),
+    )
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: (
+            cluster_checks.append("healthy") or
+            SimpleNamespace(healthy=True, ready_units=2, expected_units=2, members=[])
+        ),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    state_out = ctx.run(
+        ctx.on.update_status(),
+        testing.State(relations=[relation, _s3_relation()], planned_units=2),
+    )
+
+    peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert restart_calls == ["restart"]
+    assert ready_checks == ["ready"]
+    assert len(cluster_checks) >= 2
+    assert peer_out.local_unit_data["restart-pending"] == "false"
+    assert peer_out.local_unit_data.get("rolling-phase") is None
+
+
+def test_leader_waits_for_cluster_health_before_advancing_restart_target(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The leader should not advance a rolling restart while health is degraded."""
+    ctx = _context()
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        local_app_data={"restart-target": "loki-vm/1"},
+        local_unit_data={"restart-pending": "true"},
+        peers_data={1: {"address": "10.0.0.2", "restart-pending": "false"}},
+    )
+
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: SimpleNamespace(healthy=False, ready_units=1, expected_units=2, members=[]),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    state_out = ctx.run(
+        ctx.on.update_status(),
+        testing.State(leader=True, planned_units=2, relations=[relation, _s3_relation()]),
+    )
+
+    peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert peer_out.local_app_data["restart-target"] == "loki-vm/1"
+
+
+def test_replicas_coordination_change_uses_fast_path_without_config_rewrite(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Restart handoff on peer coordination data should not rewrite config."""
+    ctx = _context()
+    relation = testing.PeerRelation(
+        endpoint="replicas",
+        interface="loki_replica",
+        local_app_data={"restart-target": "loki-vm/0"},
+        local_unit_data={"restart-pending": "true"},
+        peers_data={1: {"address": "10.0.0.2", "restart-pending": "false"}},
+    )
+    restart_calls = []
+    write_calls = []
+    ready_checks = []
+    cluster_checks = []
+
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: write_calls.append("write"))
+    monkeypatch.setattr("charm.loki.restart", lambda: restart_calls.append("restart"))
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr("charm.loki.prepare_shutdown", lambda *_, **__: None, raising=False)
+    monkeypatch.setattr(
+        "charm.loki.check_ready",
+        lambda *_, **__: (ready_checks.append("ready") or True, None),
+    )
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._cluster_health",
+        lambda *_: (
+            cluster_checks.append("healthy") or
+            SimpleNamespace(healthy=True, ready_units=2, expected_units=2, members=[])
+        ),
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
+
+    state_out = ctx.run(
+        ctx.on.relation_changed(relation),
+        testing.State(
+            relations=[relation, _s3_relation()],
+            planned_units=2,
+            stored_states=[
+                testing.StoredState(
+                    name="_stored",
+                    owner_path="LokiVmCharm",
+                    content={
+                        "peer_addresses_json": json.dumps([["loki-vm/1", "10.0.0.2"]]),
+                        "config_drifted": False,
+                    },
+                )
+            ],
+        ),
+    )
+
+    peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert write_calls == []
+    assert restart_calls == ["restart"]
+    assert ready_checks == ["ready"]
+    assert len(cluster_checks) >= 2
+    assert peer_out.local_unit_data["restart-pending"] == "false"
 
 
 def test_replicas_relation_updates_memberlist_config(monkeypatch: pytest.MonkeyPatch):
