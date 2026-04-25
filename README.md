@@ -106,8 +106,8 @@ Garage object storage is used for:
 Example clustered deployment with Garage:
 
 ```bash
-juju deploy ./garage-vm_ubuntu@24.04-amd64.charm garage-vm --num-units 3 --config replication-mode=3
-juju deploy ./loki-vm_ubuntu-24.04-amd64.charm loki-vm --num-units 3 --storage loki-persisted=rootfs,2G --config retention-period=30
+juju deploy garage-vm garage-vm --num-units 3 --config replication-mode=3
+juju deploy loki-vm loki-vm --num-units 3 --storage loki-persisted=rootfs,2G --config retention-period=30
 juju integrate loki-vm:s3 garage-vm:s3
 ```
 
@@ -115,7 +115,7 @@ Example deployment with Canonical `s3-integrator` track `2`:
 
 ```bash
 juju deploy s3-integrator --channel=2/edge
-juju deploy ./loki-vm_ubuntu-24.04-amd64.charm loki-vm --num-units 1 --storage loki-persisted=rootfs,2G
+juju deploy loki-vm loki-vm --num-units 1 --storage loki-persisted=rootfs,2G
 juju config s3-integrator endpoint=http://10.232.126.109 region=us-east-1 bucket=mybucket s3-uri-style=path
 juju add-secret s3-creds access-key=<ACCESS_KEY> secret-key=<SECRET_KEY>
 juju grant-secret s3-creds s3-integrator
@@ -159,10 +159,10 @@ aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket observability1-lo
 Deploy and configure the Loki-specific `s3-integrator` in the consumer model:
 
 ```bash
-juju deploy -m erik-lonroth@external/observability1 s3-integrator loki-s3 --channel 2/edge
-juju add-secret -m erik-lonroth@external/observability1 ceph-rgw-observability1 access-key='<ACCESS_KEY>' secret-key='<SECRET_KEY>'
-juju grant-secret -m erik-lonroth@external/observability1 ceph-rgw-observability1 loki-s3
-juju config -m erik-lonroth@external/observability1 loki-s3 \
+juju deploy s3-integrator loki-s3 --channel 2/edge
+juju add-secret ceph-rgw-observability1 access-key='<ACCESS_KEY>' secret-key='<SECRET_KEY>'
+juju grant-secret ceph-rgw-observability1 loki-s3
+juju config loki-s3 \
   endpoint='http://192.168.243.250:8081' \
   bucket='observability1-loki' \
   credentials='secret:<secret-id>' \
@@ -171,18 +171,18 @@ juju config -m erik-lonroth@external/observability1 loki-s3 \
   region='us-east-1'
 ```
 
-Cut over Loki from `garage-vm` to the new provider:
+Cut over Loki from `garage-vm` to the new provider or just relate if you dont have a previous s3:
 
 ```bash
-juju remove-relation -m erik-lonroth@external/observability1 garage-vm:s3 loki-vm:s3
-juju integrate -m erik-lonroth@external/observability1 loki-s3:s3-credentials loki-vm:s3
+juju remove-relation garage-vm:s3 loki-vm:s3
+juju integrate loki-s3:s3-credentials loki-vm:s3
 ```
 
 Verify:
 
 ```bash
-juju status -m erik-lonroth@external/observability1 loki-s3 loki-vm
-juju ssh -m erik-lonroth@external/observability1 loki-vm/0 'sudo grep -n "observability1-loki\|192.168.243.250:8081" /etc/loki/config.yml'
+juju status loki-s3 loki-vm
+juju ssh loki-vm/0 'sudo grep -n "observability1-loki\|192.168.243.250:8081" /etc/loki/config.yml'
 ```
 
 Then run a normal Loki push/query smoke test through `loki-loadbalancer-vm`.

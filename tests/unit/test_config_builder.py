@@ -19,6 +19,7 @@ def test_config_builder_basic_fields():
     assert config["common"]["storage"]["filesystem"]["chunks_directory"].endswith("chunks")
     assert config["common"]["storage"]["filesystem"]["rules_directory"].endswith("rules")
     assert config["storage_config"]["filesystem"]["directory"].endswith("chunks")
+    assert config["limits_config"]["volume_enabled"] is True
 
 
 def test_config_builder_tsdb_schema_only():

@@ -224,6 +224,7 @@ class ConfigBuilder:
     def _limits_config(self) -> dict:
         return {
             "allow_structured_metadata": True,
+            "volume_enabled": True,
             "ingestion_rate_mb": float(self.ingestion_rate_mb),
             "ingestion_burst_size_mb": float(self.ingestion_burst_size_mb),
             "per_stream_rate_limit": f"{self.ingestion_rate_mb}MB",
