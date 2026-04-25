@@ -1,4 +1,4 @@
-# Releaseing to charmhub
+# Releasing to charmhub
 
 Login to the user: dwellir-snapcrafters
 

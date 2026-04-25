@@ -43,6 +43,8 @@ dev = [
     "pyright",
     "pytest",
     "ruff",
+    "tox",
+    "tox-uv",
 ]
 
 # Testing tools configuration

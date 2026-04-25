@@ -11,10 +11,10 @@ import requests
 
 class LokiManager:
     """
-    Mangages the Loki service, such as installing, configuring, etc.
+    Manages the Loki service, such as installing, configuring, etc.
 
     This class should work independently from juju, such as that it can
-    be tested without lauching a full juju environment.
+    be tested without launching a full juju environment.
     """
 
     def __init__(self):
