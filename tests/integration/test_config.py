@@ -1,18 +1,19 @@
 # Copyright 2026 Erik Lönroth
 # See LICENSE file for licensing details.
 
+from typing import Any
+
 import pytest
 
- 
 jubilant = pytest.importorskip("jubilant")
 
 
-def _units_all(status: jubilant.Status, app: str, predicate) -> bool:
+def _units_all(status: Any, app: str, predicate) -> bool:
     units = status.get_units(app)
     return bool(units) and all(predicate(unit) for unit in units.values())
 
 
-def test_config_update_and_revert(juju: jubilant.Juju, charm):
+def test_config_update_and_revert(juju: Any, charm):
     """Update config, then apply an invalid override and revert."""
     juju.deploy(charm.resolve(), app="loki-vm")
     juju.wait(lambda status: jubilant.all_active(status, "loki-vm"))

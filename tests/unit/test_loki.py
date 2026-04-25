@@ -2,6 +2,7 @@
 # See LICENSE file for licensing details.
 
 import subprocess
+from email.message import Message
 from pathlib import Path
 
 import pytest
@@ -126,7 +127,7 @@ def test_check_endpoint_returns_error_for_http_error(monkeypatch: pytest.MonkeyP
             url="http://example:9000",
             code=503,
             msg="Service Unavailable",
-            hdrs=None,
+            hdrs=Message(),
             fp=None,
         )
 

@@ -402,10 +402,7 @@ class LokiVmCharm(ops.CharmBase):
     def _invalid_config_status(self) -> ops.WaitingStatus:
         """Return a WaitingStatus message for invalid Loki config."""
         if self._stored.last_failed_config_path:
-            message = (
-                "Invalid Loki config; check logs and "
-                f"{self._stored.last_failed_config_path}"
-            )
+            message = f"Invalid Loki config; check logs and {self._stored.last_failed_config_path}"
         else:
             message = "Invalid Loki config; check logs to fix configuration"
         return ops.WaitingStatus(message)
@@ -452,9 +449,7 @@ class LokiVmCharm(ops.CharmBase):
         drifted = self._has_config_drift()
         if drifted != self._stored.config_drifted:
             if drifted:
-                logger.warning(
-                    "Detected manual Loki config change at %s", DEFAULT_CONFIG_PATH
-                )
+                logger.warning("Detected manual Loki config change at %s", DEFAULT_CONFIG_PATH)
             else:
                 logger.info("Loki config drift cleared.")
         self._stored.config_drifted = drifted
@@ -698,10 +693,11 @@ class LokiVmCharm(ops.CharmBase):
         """Probe local and peer readiness endpoints for cluster health."""
         members: list[ClusterMemberHealth] = []
         relation = self.model.get_relation("replicas")
-        remote_addresses = {
-            unit.name: relation.data[unit].get("address")
-            for unit in relation.units
-        } if relation is not None else {}
+        remote_addresses = (
+            {unit.name: relation.data[unit].get("address") for unit in relation.units}
+            if relation is not None
+            else {}
+        )
         known_units = {self.unit.name, *remote_addresses.keys()}
         ordered_units = sorted(
             known_units,
@@ -709,7 +705,11 @@ class LokiVmCharm(ops.CharmBase):
         )
         expected_units = len(ordered_units)
         for unit_name in ordered_units:
-            address = self._instance_addr() if unit_name == self.unit.name else remote_addresses.get(unit_name)
+            address = (
+                self._instance_addr()
+                if unit_name == self.unit.name
+                else remote_addresses.get(unit_name)
+            )
             if not address:
                 members.append(
                     ClusterMemberHealth(
@@ -786,8 +786,7 @@ class LokiVmCharm(ops.CharmBase):
         if relation is None:
             return "[]"
         addresses = sorted(
-            (unit.name, relation.data[unit].get("address", ""))
-            for unit in relation.units
+            (unit.name, relation.data[unit].get("address", "")) for unit in relation.units
         )
         return json.dumps(addresses)
 
@@ -826,15 +825,22 @@ class LokiVmCharm(ops.CharmBase):
         path = str(app_data.get("path", "")).strip()
         if path:
             raise InvalidConfigurationError("s3 relation field 'path' is not supported")
-        secret_key = str(app_data["secret-key"]).strip()
+        bucket = str(app_data.get("bucket", "")).strip()
+        endpoint = str(app_data.get("endpoint", "")).strip()
+        access_key = str(app_data.get("access-key", "")).strip()
+        secret_key = str(app_data.get("secret-key", "")).strip()
+        region = str(app_data.get("region", "")).strip()
+
+        if not all((bucket, endpoint, access_key, secret_key, region)):
+            return None
 
         return S3StorageConfig(
-            bucket=str(app_data["bucket"]).strip(),
-            endpoint=self._normalize_s3_endpoint(str(app_data["endpoint"])),
-            access_key_id=str(app_data["access-key"]).strip(),
+            bucket=bucket,
+            endpoint=self._normalize_s3_endpoint(endpoint),
+            access_key_id=access_key,
             secret_access_key=secret_key,
-            region=str(app_data["region"]).strip(),
-            insecure=self._s3_is_insecure(str(app_data["endpoint"])),
+            region=region,
+            insecure=self._s3_is_insecure(endpoint),
         )
 
     def _normalize_s3_endpoint(self, value: str) -> str:
@@ -970,9 +976,7 @@ class LokiVmCharm(ops.CharmBase):
         raw_datasources: list[DatasourceDict] = []
         for grafana_uid, ds_uids in grafana_uids_to_units_to_uids.items():
             for _, ds_uid in ds_uids.items():
-                raw_datasources.append(
-                    {"type": "loki", "uid": ds_uid, "grafana_uid": grafana_uid}
-                )
+                raw_datasources.append({"type": "loki", "uid": ds_uid, "grafana_uid": grafana_uid})
         self.datasource_exchange.publish(datasources=raw_datasources)
 
 

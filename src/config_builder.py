@@ -11,9 +11,7 @@ HTTP_LISTEN_PORT = 3100
 
 DEFAULT_CONFIG_DIR = "/etc/loki"
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.yml")
-DEFAULT_PACKAGE_CONFIG_BACKUP_PATH = os.path.join(
-    DEFAULT_CONFIG_DIR, "config.yml.package-default"
-)
+DEFAULT_PACKAGE_CONFIG_BACKUP_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.yml.package-default")
 
 # Where Loki stores its data per default
 DEFAULT_DATA_DIR = "/var/lib/loki"

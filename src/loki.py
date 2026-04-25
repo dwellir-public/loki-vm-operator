@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -19,8 +20,6 @@ from typing import Iterable
 from urllib import error, request
 
 import yaml
-import grp
-import pwd
 
 from config_builder import (
     DEFAULT_CONFIG_BACKUP_PATH,
@@ -104,9 +103,7 @@ def install() -> None:
     _run_shell(
         f"wget -q -O - {GRAFANA_GPG_KEY_URL} | gpg --dearmor > /etc/apt/keyrings/grafana.gpg"
     )
-    _run_shell(
-        f'echo "{GRAFANA_APT_SOURCE}" | tee /etc/apt/sources.list.d/grafana.list'
-    )
+    _run_shell(f'echo "{GRAFANA_APT_SOURCE}" | tee /etc/apt/sources.list.d/grafana.list')
     _run(["apt-get", "update"])
     _run(["apt-get", "install", "-y", "loki"])
 
@@ -326,7 +323,9 @@ def is_active(*, timeout: int = DEFAULT_STATUS_TIMEOUT) -> bool:
         return False
 
 
-def check_ready(base_url: str, *, timeout: int = DEFAULT_STATUS_TIMEOUT) -> tuple[bool, str | None]:
+def check_ready(
+    base_url: str, *, timeout: int = DEFAULT_STATUS_TIMEOUT
+) -> tuple[bool, str | None]:
     """Probe the Loki readiness endpoint and return `(ready, error)`."""
     ready_url = f"{base_url.rstrip('/')}/ready"
     return check_endpoint(ready_url, timeout=timeout, expected_body="ready")

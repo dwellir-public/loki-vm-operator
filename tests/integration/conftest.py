@@ -10,9 +10,10 @@ import os
 import pathlib
 import sys
 import time
+from typing import Any
 
 import pytest
- 
+
 jubilant = pytest.importorskip("jubilant")
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def charm():
     return charm_paths[0]
 
 
-def _current_controller(juju: jubilant.Juju) -> str:
+def _current_controller(juju: Any) -> str:
     """Return the current Juju controller name."""
     try:
         info = json.loads(juju.cli("whoami", "--format", "json", include_model=False))

@@ -128,7 +128,6 @@ def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
     assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
 
 
-
 def test_invalid_config_keeps_last_good(monkeypatch: pytest.MonkeyPatch):
     """Keep last-good config when validation fails on a new config."""
     ctx = _context()
@@ -345,6 +344,7 @@ def test_cluster_health_action_reports_s3_probe_failures(monkeypatch: pytest.Mon
         testing.State(planned_units=3, relations=[_s3_relation()]),
     )
 
+    assert ctx.action_results is not None
     assert ctx.action_results["healthy"] is False
     assert ctx.action_results["summary"] == "ready(3/3), storage(s3(error))"
     assert ctx.action_results["storage"] == "s3(error)"
@@ -375,6 +375,7 @@ def test_cluster_health_uses_actual_unit_numbers_for_sparse_clusters(
         testing.State(relations=[relation, _s3_relation()], planned_units=3),
     )
 
+    assert ctx.action_results is not None
     assert ctx.action_results["healthy"] is True
     assert ctx.action_results["summary"] == "ready(3/3), storage(s3(ok))"
     assert json.loads(ctx.action_results["members"]) == [
@@ -412,6 +413,8 @@ def test_clustered_non_leader_config_change_defers_restart(
     )
 
     peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert peer_out.local_unit_data is not None
+    assert peer_out.local_app_data is not None
     assert restart_calls == []
     assert peer_out.local_unit_data["restart-pending"] == "true"
     assert peer_out.local_app_data["restart-target"] == "loki-vm/1"
@@ -443,8 +446,8 @@ def test_target_unit_restarts_when_selected_by_leader(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         "charm.LokiVmCharm._cluster_health",
         lambda *_: (
-            cluster_checks.append("healthy") or
-            SimpleNamespace(healthy=True, ready_units=2, expected_units=2, members=[])
+            cluster_checks.append("healthy")
+            or SimpleNamespace(healthy=True, ready_units=2, expected_units=2, members=[])
         ),
     )
     monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
@@ -455,6 +458,7 @@ def test_target_unit_restarts_when_selected_by_leader(monkeypatch: pytest.Monkey
     )
 
     peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert peer_out.local_unit_data is not None
     assert restart_calls == ["restart"]
     assert ready_checks == ["ready"]
     assert len(cluster_checks) >= 2
@@ -488,6 +492,7 @@ def test_leader_waits_for_cluster_health_before_advancing_restart_target(
     )
 
     peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert peer_out.local_app_data is not None
     assert peer_out.local_app_data["restart-target"] == "loki-vm/1"
 
 
@@ -508,7 +513,9 @@ def test_replicas_coordination_change_uses_fast_path_without_config_rewrite(
     ready_checks = []
     cluster_checks = []
 
-    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: write_calls.append("write"))
+    monkeypatch.setattr(
+        "charm.loki.write_config_text", lambda *_, **__: write_calls.append("write")
+    )
     monkeypatch.setattr("charm.loki.restart", lambda: restart_calls.append("restart"))
     monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
     monkeypatch.setattr("charm.loki.prepare_shutdown", lambda *_, **__: None, raising=False)
@@ -519,8 +526,8 @@ def test_replicas_coordination_change_uses_fast_path_without_config_rewrite(
     monkeypatch.setattr(
         "charm.LokiVmCharm._cluster_health",
         lambda *_: (
-            cluster_checks.append("healthy") or
-            SimpleNamespace(healthy=True, ready_units=2, expected_units=2, members=[])
+            cluster_checks.append("healthy")
+            or SimpleNamespace(healthy=True, ready_units=2, expected_units=2, members=[])
         ),
     )
     monkeypatch.setattr("charm.LokiVmCharm._storage_probe_result", lambda *_: (True, None))
@@ -544,6 +551,7 @@ def test_replicas_coordination_change_uses_fast_path_without_config_rewrite(
     )
 
     peer_out = next(rel for rel in state_out.relations if rel.endpoint == "replicas")
+    assert peer_out.local_unit_data is not None
     assert write_calls == []
     assert restart_calls == ["restart"]
     assert ready_checks == ["ready"]
@@ -581,9 +589,7 @@ def test_replicas_relation_updates_memberlist_config(monkeypatch: pytest.MonkeyP
     with ctx(ctx.on.update_status(), state) as manager:
         manager.charm._configure()
 
-    rendered = "\n".join(
-        line for line in seen["config"].splitlines() if not line.startswith("#")
-    )
+    rendered = "\n".join(line for line in seen["config"].splitlines() if not line.startswith("#"))
     config_yaml = yaml.safe_load(rendered)
     assert config_yaml["common"]["ring"]["kvstore"]["store"] == "memberlist"
     assert config_yaml["memberlist"]["join_members"] == ["10.0.0.2"]
@@ -793,9 +799,7 @@ def test_s3_relation_renders_garage_backed_config(monkeypatch: pytest.MonkeyPatc
         testing.State(relations=[_s3_relation()], planned_units=1),
     )
 
-    rendered = "\n".join(
-        line for line in seen["config"].splitlines() if not line.startswith("#")
-    )
+    rendered = "\n".join(line for line in seen["config"].splitlines() if not line.startswith("#"))
     config_yaml = yaml.safe_load(rendered)
 
     assert config_yaml["schema_config"]["configs"][0]["object_store"] == "s3"
@@ -823,9 +827,7 @@ def test_s3_provider_parity(monkeypatch: pytest.MonkeyPatch, provider_name: str)
         testing.State(relations=[_s3_relation(remote_app_name=provider_name)], planned_units=1),
     )
 
-    rendered = "\n".join(
-        line for line in seen["config"].splitlines() if not line.startswith("#")
-    )
+    rendered = "\n".join(line for line in seen["config"].splitlines() if not line.startswith("#"))
     config_yaml = yaml.safe_load(rendered)
 
     assert config_yaml["schema_config"]["configs"][0]["object_store"] == "s3"
@@ -853,9 +855,7 @@ def test_s3_relation_with_retention_uses_s3_delete_store(monkeypatch: pytest.Mon
         ),
     )
 
-    rendered = "\n".join(
-        line for line in seen["config"].splitlines() if not line.startswith("#")
-    )
+    rendered = "\n".join(line for line in seen["config"].splitlines() if not line.startswith("#"))
     config_yaml = yaml.safe_load(rendered)
     assert config_yaml["compactor"]["delete_request_store"] == "s3"
 
