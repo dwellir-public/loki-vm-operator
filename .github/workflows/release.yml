@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Charmcraft
         run: sudo snap install charmcraft --classic --channel latest/stable
@@ -18,7 +18,7 @@ jobs:
         run: sudo charmcraft pack --destructive-mode --platform amd64 --quiet
 
       - name: Upload charm artifact (ubuntu@24.04:amd64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: charm-ubuntu-24-amd64
           path: ./loki-vm_amd64.charm
@@ -37,10 +37,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download built charm artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: charm-ubuntu-*-amd64
           merge-multiple: true
@@ -77,10 +77,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download built charm artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: charm-ubuntu-*-amd64
           merge-multiple: true
@@ -115,7 +115,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release and upload charm artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ steps.release_meta.outputs.tag }}
           name: ${{ steps.release_meta.outputs.name }}
