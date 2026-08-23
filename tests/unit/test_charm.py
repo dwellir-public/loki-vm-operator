@@ -177,8 +177,9 @@ class _FakeRulerApi:
     def __init__(self, base_url: str) -> None:
         self.base_urls.append(base_url)
 
-    def replace_namespace(self, groups: list[dict]) -> None:
+    def replace_namespace(self, groups: list[dict]) -> list[dict]:
         self.calls.append(groups)
+        return []
 
 
 @pytest.fixture(autouse=True)

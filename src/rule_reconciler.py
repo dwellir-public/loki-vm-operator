@@ -65,8 +65,9 @@ class InvalidRuleCacheError(ValueError):
 class RulerClient(Protocol):
     """Describe the Loki ruler operation required by the reconciler."""
 
-    def replace_namespace(self, groups: list[dict[str, Any]]) -> None:
-        """Replace the charm-owned namespace with the supplied groups."""
+    def replace_namespace(self, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace the namespace and return its validated pre-apply contents."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -441,15 +442,15 @@ class LokiRuleReconciler:
             encoded_candidate = _encode_cache(candidate)
         except (InvalidRuleCacheError, InvalidRuleSnapshotError) as exc:
             logger.warning("Retaining the last accepted Loki rule state: %s", exc)
-            self._replay(previous.accepted_groups)
+            self._replay_cached(cache_valid, previous.accepted_groups)
             return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
         try:
-            self._client.replace_namespace(accepted_candidate)
+            live_before = self._client.replace_namespace(accepted_candidate)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Failed to apply Loki rule candidate; retaining accepted state: %s", exc
             )
-            self._replay(previous.accepted_groups)
+            self._replay_cached(cache_valid, previous.accepted_groups)
             return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
         try:
             persist(encoded_candidate)
@@ -457,9 +458,14 @@ class LokiRuleReconciler:
             logger.warning(
                 "Failed to persist Loki rule candidate; restoring accepted state: %s", exc
             )
-            self._replay(previous.accepted_groups)
+            self._replay(previous.accepted_groups if cache_valid else live_before)
             return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
         return RuleReconcileResult(copy.deepcopy(accepted_candidate), True)
+
+    def _replay_cached(self, cache_valid: bool, accepted_groups: list[dict[str, Any]]) -> None:
+        """Replay cached state only when it came from a validated cache."""
+        if cache_valid:
+            self._replay(accepted_groups)
 
     def _replay(self, accepted_groups: list[dict[str, Any]]) -> None:
         """Best-effort restore the accepted namespace after candidate failure."""
@@ -513,8 +519,8 @@ class LokiRulerApiClient:
         self._timeout = timeout
         self._clock = clock
 
-    def replace_namespace(self, groups: list[dict[str, Any]]) -> None:
-        """Replace the namespace transactionally and roll back partial failures."""
+    def replace_namespace(self, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Replace transactionally and return validated state for caller rollback."""
         budget = _ApplyBudget(deadline=self._clock() + MAX_APPLY_SECONDS, clock=self._clock)
         desired = copy.deepcopy(groups)
         _validate_tree(desired, max_nodes=MAX_CACHE_NODES)
@@ -523,7 +529,7 @@ class LokiRulerApiClient:
         _validate_aggregate_limits(desired)
         current = self._read_namespace(budget)
         if self._canonical(current) == self._canonical(desired):
-            return
+            return copy.deepcopy(current)
         try:
             self._write_namespace(desired, budget)
         except Exception:
@@ -532,6 +538,7 @@ class LokiRulerApiClient:
             except Exception as rollback_error:  # noqa: BLE001
                 logger.warning("Failed to roll back the Loki ruler namespace: %s", rollback_error)
             raise
+        return copy.deepcopy(current)
 
     @property
     def _namespace_url(self) -> str:

@@ -168,11 +168,13 @@ class FakeRulerClient:
         self.calls: list[list[dict[str, Any]]] = []
         self.fail = False
 
-    def replace_namespace(self, groups: list[dict[str, Any]]) -> None:
+    def replace_namespace(self, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        previous = self.groups
         self.calls.append(groups)
         if self.fail:
             raise RuntimeError("ruler unavailable")
         self.groups = groups
+        return previous
 
 
 class FakeResponse:
@@ -375,6 +377,74 @@ def test_invalid_cache_with_malformed_source_never_applies_partial_state(
     assert result.committed is False
     assert client.calls == []
     assert persisted == []
+
+
+@pytest.mark.parametrize("cache_value", ["not-base64", "A" * MAX_CACHE_VALUE_BYTES])
+def test_invalid_cache_with_aggregate_invalid_candidate_never_replays_synthetic_empty(
+    cache_value: str,
+) -> None:
+    """A rejected reconstruction must leave unknown live ruler state untouched."""
+    client = FakeRulerClient()
+    client.groups = [_group("unknown-live")]
+    persisted: list[str] = []
+
+    result = LokiRuleReconciler(client).reconcile(
+        [
+            RelationRuleSource(1, _raw(_group("duplicate"))),
+            RelationRuleSource(2, _raw(_group("duplicate"))),
+        ],
+        cache_value=cache_value,
+        persist=persisted.append,
+    )
+
+    assert result.committed is False
+    assert client.calls == []
+    assert client.groups == [_group("unknown-live")]
+    assert persisted == []
+
+
+@pytest.mark.parametrize("cache_value", ["not-base64", "A" * MAX_CACHE_VALUE_BYTES])
+def test_invalid_cache_with_apply_failure_never_replays_synthetic_empty(
+    cache_value: str,
+) -> None:
+    """An apply failure must not trigger rollback from an untrusted empty cache."""
+    client = FakeRulerClient()
+    client.groups = [_group("unknown-live")]
+    client.fail = True
+    persisted: list[str] = []
+
+    result = LokiRuleReconciler(client).reconcile(
+        [RelationRuleSource(1, _raw(_group("candidate")))],
+        cache_value=cache_value,
+        persist=persisted.append,
+    )
+
+    assert result.committed is False
+    assert client.calls == [[_group("candidate")]]
+    assert client.groups == [_group("unknown-live")]
+    assert persisted == []
+
+
+@pytest.mark.parametrize("cache_value", ["not-base64", "A" * MAX_CACHE_VALUE_BYTES])
+def test_invalid_cache_with_persist_failure_restores_captured_live_namespace(
+    cache_value: str,
+) -> None:
+    """A post-apply failure must restore actual live state, never synthetic empty state."""
+    client = FakeRulerClient()
+    client.groups = [_group("unknown-live")]
+
+    def fail_persist(_value: str) -> None:
+        raise RuntimeError("databag full")
+
+    result = LokiRuleReconciler(client).reconcile(
+        [RelationRuleSource(1, _raw(_group("candidate")))],
+        cache_value=cache_value,
+        persist=fail_persist,
+    )
+
+    assert result.committed is False
+    assert client.calls == [[_group("candidate")], [_group("unknown-live")]]
+    assert client.groups == [_group("unknown-live")]
 
 
 def test_apply_failure_keeps_prior_accepted_cache_and_rules() -> None:
@@ -603,8 +673,11 @@ def test_api_client_replaces_namespace_and_uses_yaml_group_posts() -> None:
         ]
     )
 
-    LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([new])
+    previous = LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace(
+        [new]
+    )
 
+    assert previous == [old]
     assert [request[0] for request in session.requests] == ["GET", "DELETE", "POST"]
     assert session.requests[-1][2]["headers"] == {"Content-Type": "application/yaml"}
     assert "name: new" in session.requests[-1][2]["data"]
