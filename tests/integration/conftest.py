@@ -55,11 +55,9 @@ def rule_provider_charm() -> pathlib.Path:
         if not path.exists():
             raise FileNotFoundError(f"Rule provider charm does not exist: {path}")
         return path
-    paths = list(pathlib.Path("tests/integration/rule-provider").glob("*.charm"))
-    if not paths:
-        provider_dir = pathlib.Path("tests/integration/rule-provider")
-        subprocess.run(["charmcraft", "pack"], cwd=provider_dir, check=True)
-        paths = list(provider_dir.glob("*.charm"))
+    provider_dir = pathlib.Path("tests/integration/rule-provider")
+    subprocess.run(["charmcraft", "pack", "--destructive-mode"], cwd=provider_dir, check=True)
+    paths = list(provider_dir.glob("*.charm"))
     if len(paths) != 1:
         raise RuntimeError("Expected exactly one built rule-provider charm")
     return paths[0]

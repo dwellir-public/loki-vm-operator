@@ -334,18 +334,47 @@ def test_duplicate_group_names_retain_previous_accepted_aggregate() -> None:
     assert client.groups == first.accepted_groups
 
 
-def test_invalid_cache_fails_closed_while_accepting_current_valid_source() -> None:
+@pytest.mark.parametrize("cache_value", ["not-base64", "A" * MAX_CACHE_VALUE_BYTES])
+def test_invalid_cache_fails_closed_while_accepting_current_valid_source(
+    cache_value: str,
+) -> None:
     client = FakeRulerClient()
     persisted: list[str] = []
 
     result = LokiRuleReconciler(client).reconcile(
         [RelationRuleSource(9, _raw(_group("fresh")))],
-        cache_value="not-base64",
+        cache_value=cache_value,
         persist=persisted.append,
     )
 
     assert [group["name"] for group in result.accepted_groups] == ["fresh"]
     assert persisted
+
+
+@pytest.mark.parametrize(
+    "cache_value",
+    ["not-base64", "A" * MAX_CACHE_VALUE_BYTES],
+    ids=["corrupt", "over-limit"],
+)
+def test_invalid_cache_with_malformed_source_never_applies_partial_state(
+    cache_value: str,
+) -> None:
+    """Unknown cached LKG must not be replaced by only reconstructable siblings."""
+    client = FakeRulerClient()
+    persisted: list[str] = []
+
+    result = LokiRuleReconciler(client).reconcile(
+        [
+            RelationRuleSource(1, "not-json"),
+            RelationRuleSource(2, _raw(_group("valid-sibling"))),
+        ],
+        cache_value=cache_value,
+        persist=persisted.append,
+    )
+
+    assert result.committed is False
+    assert client.calls == []
+    assert persisted == []
 
 
 def test_apply_failure_keeps_prior_accepted_cache_and_rules() -> None:

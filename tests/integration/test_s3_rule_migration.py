@@ -18,6 +18,84 @@ jubilant = pytest.importorskip("jubilant")
 NAMESPACE = "juju-loki-vm"
 
 
+def _remote_relation_values(
+    juju: Any,
+    *,
+    unit: str,
+    endpoint: str,
+    key: str,
+) -> dict[str, str]:
+    """Read provider-published values keyed by remote unit."""
+    document = json.loads(juju.cli("show-unit", unit, "--format", "json"))
+    values = {
+        str(remote_name): str(remote["data"][key])
+        for relation in document[unit].get("relation-info", [])
+        if relation.get("endpoint") == endpoint
+        for remote_name, remote in relation.get("related-units", {}).items()
+        if key in remote.get("data", {})
+    }
+    if not values:
+        raise AssertionError(f"Expected {endpoint}.{key} values on {unit}, found none")
+    return values
+
+
+def _relation_contracts(juju: Any) -> tuple[dict[str, str], dict[str, str]]:
+    """Return per-unit gateway-backend and datasource endpoint contracts."""
+    return (
+        _remote_relation_values(
+            juju,
+            unit="rule-source-a/0",
+            endpoint="send-loki-logs",
+            key="endpoint",
+        ),
+        _remote_relation_values(
+            juju,
+            unit="rule-source-a/0",
+            endpoint="receive-datasource",
+            key="grafana_source_host",
+        ),
+    )
+
+
+def test_remote_relation_values_model_the_multiunit_contract() -> None:
+    class FakeJuju:
+        def cli(self, *args: str) -> str:
+            assert args == ("show-unit", "source/0", "--format", "json")
+            return json.dumps(
+                {
+                    "source/0": {
+                        "relation-info": [
+                            {
+                                "endpoint": "backend",
+                                "related-units": {
+                                    "loki-vm/1": {"data": {"endpoint": "http://one:3100"}},
+                                    "loki-vm/2": {"data": {"endpoint": "http://two:3100"}},
+                                },
+                            }
+                        ]
+                    }
+                }
+            )
+
+    assert _remote_relation_values(
+        FakeJuju(), unit="source/0", endpoint="backend", key="endpoint"
+    ) == {
+        "loki-vm/1": "http://one:3100",
+        "loki-vm/2": "http://two:3100",
+    }
+
+
+def _assert_surviving_relation_contracts(
+    before: tuple[dict[str, str], dict[str, str]],
+    after: tuple[dict[str, str], dict[str, str]],
+    *,
+    surviving_unit: str,
+) -> None:
+    """Assert each relation still publishes the surviving unit's original value."""
+    for before_values, after_values in zip(before, after, strict=True):
+        assert after_values == {surviving_unit: before_values[surviving_unit]}
+
+
 def test_wait_for_configured_s3_endpoint_uses_requested_live_unit() -> None:
     class FakeJuju:
         def __init__(self) -> None:
@@ -258,7 +336,7 @@ def _rules(group: str, alert: str, source: str) -> str:
                                 f'count_over_time({{job="task7a-s3",source="{source}"}}[1m]) > 0'
                             ),
                             "for": "0s",
-                            "labels": {"source": source},
+                            "labels": {"severity": f"{source}-warning", "source": source},
                         }
                     ],
                 }
@@ -268,27 +346,33 @@ def _rules(group: str, alert: str, source: str) -> str:
     )
 
 
-def _expected_rules() -> list[tuple[str, str, str]]:
+def _expected_rules() -> list[tuple[str, str, dict[str, str]]]:
     return [
-        ("source-a", "SourceAAlert", "a"),
-        ("source-b", "SourceBAlert", "b"),
+        ("source-a", "SourceAAlert", {"severity": "a-warning", "source": "a"}),
+        ("source-b", "SourceBAlert", {"severity": "b-warning", "source": "b"}),
     ]
 
 
-def _rule_tuples(document: dict[str, Any]) -> list[tuple[str, str, str]]:
+def _rule_tuples(document: dict[str, Any]) -> list[tuple[str, str, dict[str, str]]]:
     """Extract deterministic group, alert, and source-label tuples."""
     return [
         (
             str(group.get("name")),
             str(rule.get("alert") or rule.get("name")),
-            str(rule.get("labels", {}).get("source")),
+            {str(key): str(value) for key, value in rule.get("labels", {}).items()},
         )
         for group in document.get("groups", [])
         for rule in group.get("rules", [])
     ]
 
 
-def _wait_for_namespace(juju: Any, *, unit: str, timeout: float = 240) -> None:
+def _wait_for_namespace(
+    juju: Any,
+    *,
+    unit: str,
+    expected: list[tuple[str, str, dict[str, str]]] | None = None,
+    timeout: float = 240,
+) -> None:
     """Wait for the exact shared S3 namespace content and deterministic ordering."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -303,7 +387,9 @@ def _wait_for_namespace(juju: Any, *, unit: str, timeout: float = 240) -> None:
         except Exception:  # noqa: BLE001 - ruler propagation is eventually consistent.
             time.sleep(5)
             continue
-        if isinstance(document, dict) and _rule_tuples(document) == _expected_rules():
+        if isinstance(document, dict) and _rule_tuples(document) == (
+            expected or _expected_rules()
+        ):
             return
         time.sleep(5)
     raise AssertionError(f"Loki on {unit} did not expose the exact shared rule namespace")
@@ -391,15 +477,37 @@ def test_s3_upgrade_preserves_logs_rules_and_leader_recovery(
     )
     juju.integrate("rule-source-a:send-loki-logs", "loki-vm:loki_push_api")
     juju.integrate("rule-source-b:send-loki-logs", "loki-vm:loki_push_api")
+    juju.integrate("rule-source-a:receive-datasource", "loki-vm:grafana-source")
     juju.wait(jubilant.all_active, timeout=20 * 60)
+    relation_contracts = _relation_contracts(juju)
     _wait_for_namespace(juju, unit="loki-vm/1")
     _wait_for_namespace(juju, unit="loki-vm/2")
+    assert _relation_contracts(juju) == relation_contracts
     _wait_for_log(juju, unit="loki-vm/2", marker=pre_marker, timestamp=pre_timestamp)
     _wait_for_log(juju, unit="loki-vm/2", marker=fresh_marker, timestamp=fresh_timestamp)
     _gracefully_stop_and_remove(juju, unit="loki-vm/1")
     _wait_for_leader(juju, unit="loki-vm/2")
     juju.wait(jubilant.all_active, timeout=20 * 60)
     _wait_for_namespace(juju, unit="loki-vm/2")
+    _assert_surviving_relation_contracts(
+        relation_contracts, _relation_contracts(juju), surviving_unit="loki-vm/2"
+    )
+    juju.config(
+        "rule-source-a",
+        {"alert-rules": _rules("source-a-failover", "SourceAFailoverAlert", "a")},
+    )
+    failover_rules = [
+        (
+            "source-a-failover",
+            "SourceAFailoverAlert",
+            {"severity": "a-warning", "source": "a"},
+        ),
+        ("source-b", "SourceBAlert", {"severity": "b-warning", "source": "b"}),
+    ]
+    _wait_for_namespace(juju, unit="loki-vm/2", expected=failover_rules)
+    _assert_surviving_relation_contracts(
+        relation_contracts, _relation_contracts(juju), surviving_unit="loki-vm/2"
+    )
     _wait_for_log(juju, unit="loki-vm/2", marker=pre_marker, timestamp=pre_timestamp)
     _wait_for_log(juju, unit="loki-vm/2", marker=fresh_marker, timestamp=fresh_timestamp)
     post_failover_marker = f"task7a-post-failover-{time.time_ns()}"

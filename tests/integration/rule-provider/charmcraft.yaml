@@ -17,6 +17,8 @@ parts:
 requires:
   send-loki-logs:
     interface: loki_push_api
+  receive-datasource:
+    interface: grafana_datasource
 
 config:
   options:

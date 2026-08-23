@@ -397,11 +397,13 @@ class LokiRuleReconciler:
         persist: Callable[[str], None],
     ) -> RuleReconcileResult:
         """Validate sources, apply a candidate, and persist only accepted state."""
+        cache_valid = True
         try:
             previous = _decode_cache(cache_value)
         except InvalidRuleCacheError as exc:
             logger.warning("Ignoring invalid leader-shared Loki rule cache: %s", exc)
             previous = _RuleCache(snapshots={}, accepted_groups=[])
+            cache_valid = False
         ordered = sorted(sources, key=lambda source: source.relation_id)
         if len(ordered) > MAX_SOURCE_RELATIONS:
             logger.warning(
@@ -416,15 +418,23 @@ class LokiRuleReconciler:
             for relation_id, groups in previous.snapshots.items()
             if relation_id in admitted_ids
         }
+        invalid_source = False
         for source in admitted:
             try:
                 snapshots[source.relation_id] = parse_rule_groups(source.raw_payload)
             except InvalidRuleSnapshotError as exc:
+                invalid_source = True
                 logger.warning(
                     "Retaining valid Loki rules for relation %s when available: %s",
                     source.relation_id,
                     exc,
                 )
+        if not cache_valid and invalid_source:
+            logger.warning(
+                "Cannot reconstruct complete Loki rule state from current relations; "
+                "leaving the ruler namespace unchanged"
+            )
+            return RuleReconcileResult([], False)
         try:
             accepted_candidate = merge_rule_groups(snapshots)
             candidate = _RuleCache(snapshots=snapshots, accepted_groups=accepted_candidate)
