@@ -88,19 +88,23 @@ is reported as waiting until the operator upgrades Loki or supplies a compatible
 `config-override`. See Grafana's
 [storage-client migration guide](https://grafana.com/docs/loki/latest/setup/migrate/migrate-storage-clients/).
 
-When `config-override` is used, it must retain `auth_enabled: false`, Loki's
-HTTP listener on port 3100, `ruler.enable_api: true`, a non-empty
-`ruler.rule_path`, and a `ruler_storage.backend`. The charm reports a clear
-waiting status instead of attempting rule reconciliation against an override
-that omits this contract.
+Existing `config-override` values remain valid without ruler settings. Relation
+alert-rule reconciliation is enabled only when an override retains
+`auth_enabled: false`, Loki's HTTP listener on port 3100,
+`ruler.enable_api: true`, a non-empty `ruler.rule_path`, and a
+`ruler_storage.backend`. Without that contract the workload continues normally;
+if a relation actually supplies alert rules, the charm skips ruler mutation and
+reports a clear waiting status.
 
 Each relation document must be strictly below 60 KiB. The charm also bounds
 JSON depth, node count, group-name bytes, cache size, the number of admitted
 source relations, and aggregate group/rule and ruler-API work. One apply has a
 fixed total deadline; if a timed-out write has mutated Loki, restoration of the
 captured namespace receives a separate bounded recovery deadline. Mutation
-responses are streamed, size-limited, and always closed. A malformed or over-limit update retains that relation's
-last-known-good snapshot while valid sibling relations continue. Valid omission
+responses are streamed, size-limited, and always closed. A reconciliation has
+an explicit 2,054-operation and 120-second structural ceiling, including at
+most one compensating replace. A malformed or over-limit update retains that
+relation's last-known-good snapshot while valid sibling relations continue. Valid omission
 or relation removal withdraws owned groups.
 
 The `replicas` application databag stores a bounded compressed cache containing

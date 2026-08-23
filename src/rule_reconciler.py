@@ -53,6 +53,8 @@ MAX_APPLY_SECONDS = 30
 MAX_MUTATION_API_OPERATIONS = 1 + MAX_TOTAL_GROUPS
 # One read plus a full candidate mutation and worst-case full recovery.
 MAX_API_OPERATIONS = 1 + 2 * MAX_MUTATION_API_OPERATIONS
+MAX_RECONCILE_API_OPERATIONS = 2 * MAX_API_OPERATIONS
+MAX_RECONCILE_SECONDS = 4 * MAX_APPLY_SECONDS
 
 
 class InvalidRuleSnapshotError(ValueError):
@@ -61,6 +63,14 @@ class InvalidRuleSnapshotError(ValueError):
 
 class InvalidRuleCacheError(ValueError):
     """Report malformed or oversized leader-shared rule state."""
+
+
+class RulerApplyError(RuntimeError):
+    """Report a failed mutation and whether captured live state was restored."""
+
+    def __init__(self, *, restored: bool):
+        super().__init__("Loki ruler namespace apply failed")
+        self.restored = restored
 
 
 class RulerClient(Protocol):
@@ -445,13 +455,12 @@ class LokiRuleReconciler:
             logger.warning("Retaining the last accepted Loki rule state: %s", exc)
             self._replay_cached(cache_valid, previous.accepted_groups)
             return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
-        try:
-            live_before = self._client.replace_namespace(accepted_candidate)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to apply Loki rule candidate; retaining accepted state: %s", exc
-            )
-            self._replay_cached(cache_valid, previous.accepted_groups)
+        live_before = self._apply_candidate(
+            accepted_candidate,
+            cache_valid=cache_valid,
+            previous_groups=previous.accepted_groups,
+        )
+        if live_before is None:
             return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
         try:
             persist(encoded_candidate)
@@ -462,6 +471,27 @@ class LokiRuleReconciler:
             self._replay(previous.accepted_groups if cache_valid else live_before)
             return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
         return RuleReconcileResult(copy.deepcopy(accepted_candidate), True)
+
+    def _apply_candidate(
+        self,
+        groups: list[dict[str, Any]],
+        *,
+        cache_valid: bool,
+        previous_groups: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Apply once and avoid redundant replay when the API already recovered."""
+        try:
+            return self._client.replace_namespace(groups)
+        except RulerApplyError as exc:
+            logger.warning("Failed to apply Loki rule candidate: %s", exc)
+            if not exc.restored:
+                self._replay_cached(cache_valid, previous_groups)
+        except InvalidRuleSnapshotError as exc:
+            logger.warning("Rejected Loki ruler state without mutation: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - injected clients may not be transactional.
+            logger.warning("Failed to apply Loki rule candidate: %s", exc)
+            self._replay_cached(cache_valid, previous_groups)
+        return None
 
     def _replay_cached(self, cache_valid: bool, accepted_groups: list[dict[str, Any]]) -> None:
         """Replay cached state only when it came from a validated cache."""
@@ -538,7 +568,8 @@ class LokiRulerApiClient:
             return copy.deepcopy(current)
         try:
             self._write_namespace(desired, budget)
-        except Exception:
+        except Exception as apply_error:
+            restored = False
             try:
                 recovery_budget = _ApplyBudget(
                     deadline=self._clock() + MAX_APPLY_SECONDS,
@@ -546,9 +577,10 @@ class LokiRulerApiClient:
                     operations_remaining=MAX_MUTATION_API_OPERATIONS,
                 )
                 self._write_namespace(current, recovery_budget)
+                restored = True
             except Exception as rollback_error:  # noqa: BLE001
                 logger.warning("Failed to roll back the Loki ruler namespace: %s", rollback_error)
-            raise
+            raise RulerApplyError(restored=restored) from apply_error
         return copy.deepcopy(current)
 
     @property
@@ -595,7 +627,7 @@ class LokiRulerApiClient:
     def _response_groups(self, document: Any) -> list[Any]:
         """Normalize Loki's supported namespace response shapes to a group list."""
         if document is None:
-            return []
+            raise InvalidRuleSnapshotError("Loki ruler namespace response is empty")
         if isinstance(document, dict) and self.NAMESPACE in document:
             groups = document[self.NAMESPACE]
             if isinstance(groups, list):

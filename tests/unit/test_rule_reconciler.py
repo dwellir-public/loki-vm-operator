@@ -19,6 +19,8 @@ from rule_reconciler import (
     MAX_CACHE_DECODED_BYTES,
     MAX_CACHE_NODES,
     MAX_CACHE_VALUE_BYTES,
+    MAX_RECONCILE_API_OPERATIONS,
+    MAX_RECONCILE_SECONDS,
     MAX_RELATION_VALUE_BYTES,
     MAX_SOURCE_RELATIONS,
     MAX_TOTAL_GROUPS,
@@ -28,6 +30,7 @@ from rule_reconciler import (
     LokiRulerApiClient,
     LokiRuleReconciler,
     RelationRuleSource,
+    RulerApplyError,
     _decode_cache,
     merge_rule_groups,
     parse_rule_groups,
@@ -716,6 +719,17 @@ def test_api_client_rejects_unknown_nonempty_namespace_mapping() -> None:
     assert response.closed is True
 
 
+def test_api_client_rejects_empty_success_body_without_mutation() -> None:
+    response = FakeResponse(200, "")
+    session = FakeSession([response])
+
+    with pytest.raises(InvalidRuleSnapshotError):
+        LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([])
+
+    assert [request[0] for request in session.requests] == ["GET"]
+    assert response.closed is True
+
+
 def test_api_client_accepts_explicit_empty_namespace_mapping() -> None:
     response = FakeResponse(200, "{}")
     session = FakeSession([response])
@@ -754,11 +768,12 @@ def test_api_client_bounds_write_response_body() -> None:
     rollback_delete = FakeResponse(202)
     session = FakeSession([FakeResponse(200, "{}"), oversized, rollback_delete])
 
-    with pytest.raises(InvalidRuleSnapshotError):
+    with pytest.raises(RulerApplyError) as raised:
         LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace(
             [_group("new")]
         )
 
+    assert isinstance(raised.value.__cause__, InvalidRuleSnapshotError)
     assert oversized.closed is True
     assert rollback_delete.closed is True
 
@@ -782,11 +797,12 @@ def test_api_client_deadline_bounds_slow_write_response_and_recovers() -> None:
         ]
     )
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(RulerApplyError) as raised:
         LokiRulerApiClient(
             "http://127.0.0.1:3100", session=session, clock=clock
         ).replace_namespace([_group("new")])
 
+    assert isinstance(raised.value.__cause__, TimeoutError)
     assert late_delete.closed is True
     assert rollback_delete.closed is True
     assert rollback_post.closed is True
@@ -913,11 +929,12 @@ def test_api_client_deadline_stops_after_late_write_response() -> None:
         ]
     )
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(RulerApplyError) as raised:
         LokiRulerApiClient(
             "http://127.0.0.1:3100", session=session, clock=clock
         ).replace_namespace([new])
 
+    assert isinstance(raised.value.__cause__, TimeoutError)
     assert [request[0] for request in session.requests] == [
         "GET",
         "DELETE",
@@ -931,11 +948,12 @@ def test_api_client_deadline_recovery_restores_captured_namespace(expire_after: 
     old = [_group("old-a"), _group("old-b")]
     session = StatefulRulerSession(old, expire_after=expire_after)
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(RulerApplyError) as raised:
         LokiRulerApiClient(
             "http://127.0.0.1:3100", session=session, clock=session.clock
         ).replace_namespace([_group("new-a"), _group("new-b")])
 
+    assert isinstance(raised.value.__cause__, TimeoutError)
     assert session.groups == old
 
 
@@ -963,3 +981,71 @@ def test_reconcile_deadline_recovery_restores_live_namespace(
     assert result.committed is False
     assert session.groups == old
     assert persisted == []
+    expected_requests = 5 if expire_after == "delete" else 6
+    assert len(session.requests) == expected_requests
+    assert len(session.requests) <= MAX_RECONCILE_API_OPERATIONS
+    assert session.clock.now <= MAX_RECONCILE_SECONDS
+
+
+@pytest.mark.parametrize("cache_valid", [True, False], ids=["valid-cache", "invalid-cache"])
+def test_reconcile_worst_case_recovery_stays_within_global_operation_bound(
+    cache_valid: bool,
+) -> None:
+    current = [{"name": f"old-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
+    desired = [{"name": f"new-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
+    responses = [FakeResponse(200, json.dumps(current)), FakeResponse(202)]
+    responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS - 1))
+    responses.append(FakeResponse(500))
+    responses.append(FakeResponse(202))
+    responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS))
+    session = FakeSession(responses)
+    client = LokiRulerApiClient("http://127.0.0.1:3100", session=session, clock=lambda: 0.0)
+    cache_value = (
+        _encoded_cache(_cache_document(relations={"1": current}, accepted=current))
+        if cache_valid
+        else "not-base64"
+    )
+
+    result = LokiRuleReconciler(client).reconcile(
+        [RelationRuleSource(1, _raw(*desired))],
+        cache_value=cache_value,
+        persist=lambda _value: None,
+    )
+
+    assert result.committed is False
+    assert len(session.requests) == MAX_API_OPERATIONS
+    assert len(session.requests) <= MAX_RECONCILE_API_OPERATIONS
+
+
+def test_reconcile_worst_case_failed_recovery_and_replay_hits_global_bound() -> None:
+    old = [{"name": f"old-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
+    new = [{"name": f"new-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
+    drift = [{"name": f"drift-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
+
+    def failed_candidate_and_recovery(
+        current: list[dict[str, Any]], *, recovery_status: int
+    ) -> list[FakeResponse]:
+        responses = [FakeResponse(200, json.dumps(current)), FakeResponse(202)]
+        responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS - 1))
+        responses.append(FakeResponse(500))
+        responses.append(FakeResponse(202))
+        responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS - 1))
+        responses.append(FakeResponse(recovery_status))
+        return responses
+
+    responses = failed_candidate_and_recovery(old, recovery_status=500)
+    responses.extend(failed_candidate_and_recovery(drift, recovery_status=202))
+    session = FakeSession(responses)
+    cache = _encoded_cache(_cache_document(relations={"1": old}, accepted=old))
+
+    result = LokiRuleReconciler(
+        LokiRulerApiClient("http://127.0.0.1:3100", session=session, clock=lambda: 0.0)
+    ).reconcile(
+        [RelationRuleSource(1, _raw(*new))],
+        cache_value=cache,
+        persist=lambda _value: None,
+    )
+
+    assert result.committed is False
+    assert len(session.requests) == MAX_RECONCILE_API_OPERATIONS
+    assert not session.responses

@@ -48,8 +48,9 @@ This generated configuration has an explicit Loki 3.4.0 minimum because that
 release introduced `use_thanos_objstore`. Charm refresh intentionally does not
 upgrade the APT workload: a known older installed version retains its last-good
 configuration and produces a waiting status. A custom override may support a
-different Loki version, but it must explicitly preserve the ruler API/storage
-contract described above or the charm rejects it before writing.
+different Loki version. Overrides without the ruler API/storage contract remain
+valid for the workload, but relation alert-rule reconciliation is disabled and
+becomes a waiting status if a producer supplies rules.
 
 ## Relation Flows
 
@@ -79,7 +80,10 @@ single `juju-loki-vm` namespace through Loki's supported ruler HTTP API; unchang
 rewritten, while updates and removals use group YAML requests. Mutation responses
 are streamed, bounded, and closed. A failed or expired candidate write restores
 the captured pre-apply namespace under an independent bounded recovery budget,
-so an exhausted candidate deadline cannot prevent rollback.
+so an exhausted candidate deadline cannot prevent rollback. A structured apply
+failure records whether that recovery completed, avoiding redundant replay; at
+most one compensating replace remains, for a structural ceiling of 2,054 HTTP
+operations and 120 seconds per reconciliation.
 
 The `replicas` application databag contains a versioned, compressed, bounded cache of each
 relation's last-known-good snapshot plus the last accepted aggregate. Malformed sources are

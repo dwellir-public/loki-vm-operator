@@ -219,7 +219,8 @@ class LokiVmCharm(ops.CharmBase):
         loki.start()
         if not self._wait_for_single_unit_ready():
             return
-        self._reconcile_rules()
+        if not self._reconcile_rules():
+            return
         version = loki.get_version()
         if version is not None:
             self.unit.set_workload_version(version)
@@ -370,14 +371,14 @@ class LokiVmCharm(ops.CharmBase):
         self.unit.status = self._runtime_health_status()
         self._reconcile_rules()
 
-    def _reconcile_rules(self, *, excluded_relation_id: int | None = None) -> None:
+    def _reconcile_rules(self, *, excluded_relation_id: int | None = None) -> bool:
         """Apply bounded relation rules and persist accepted state in peer app data."""
         if not self._is_leader():
-            return
+            return True
         peer = self._peer_relation()
         if peer is None:
             logger.warning("Cannot reconcile Loki rules until the replicas relation is available")
-            return
+            return True
         sources = [
             RelationRuleSource(
                 relation.id,
@@ -387,6 +388,18 @@ class LokiVmCharm(ops.CharmBase):
             if relation.id != excluded_relation_id and relation.app is not None
         ]
         cache_value = peer.data[self.app].get(RULE_CACHE_KEY)
+        override = str(self.config.get("config-override", "")).strip()
+        if override and not self._override_has_ruler_contract(override):
+            logger.warning(
+                "Skipping relation alert-rule reconciliation because config-override "
+                "does not provide the managed ruler API/storage contract"
+            )
+            if any(source.raw_payload is not None for source in sources) or cache_value:
+                self.unit.status = ops.WaitingStatus(
+                    "config-override disables relation alert-rule reconciliation"
+                )
+                return False
+            return True
         client = LokiRulerApiClient("http://127.0.0.1:3100")
         reconciler = LokiRuleReconciler(client)
         reconciler.reconcile(
@@ -394,6 +407,7 @@ class LokiVmCharm(ops.CharmBase):
             cache_value=cache_value,
             persist=lambda value: peer.data[self.app].__setitem__(RULE_CACHE_KEY, value),
         )
+        return True
 
     def _fast_reconcile_rolling_restart(self) -> None:
         """Advance rolling restart state without rewriting config."""
@@ -492,7 +506,10 @@ class LokiVmCharm(ops.CharmBase):
         """Return the Loki config as a YAML string."""
         override = str(self.config.get("config-override", "")).strip()
         if override:
-            self._validate_override_ruler_contract(override)
+            if not self._override_has_ruler_contract(override):
+                logger.warning(
+                    "config-override does not enable relation alert-rule reconciliation"
+                )
             return override
         source_data = self._sorted_source_data()
         builder = ConfigBuilder(
@@ -512,14 +529,14 @@ class LokiVmCharm(ops.CharmBase):
         return f"{loki.GENERATED_CONFIG_HEADER}{rendered}"
 
     @staticmethod
-    def _validate_override_ruler_contract(override: str) -> None:
-        """Require override config to retain the local ruler contract used by the charm."""
+    def _override_has_ruler_contract(override: str) -> bool:
+        """Return whether an override retains the local ruler contract used by the charm."""
         try:
             document = yaml.safe_load(override)
-        except yaml.YAMLError as exc:
-            raise InvalidConfigurationError("config-override must be valid YAML") from exc
+        except yaml.YAMLError:
+            return False
         if not isinstance(document, dict):
-            raise InvalidConfigurationError("config-override must be a YAML mapping")
+            return False
         ruler = document.get("ruler")
         ruler_storage = document.get("ruler_storage")
         server = document.get("server")
@@ -533,10 +550,7 @@ class LokiVmCharm(ops.CharmBase):
             and isinstance(ruler_storage, dict)
             and bool(ruler_storage.get("backend"))
         )
-        if not capable:
-            raise InvalidConfigurationError(
-                "config-override must enable the charm-managed ruler API"
-            )
+        return capable
 
     def _validate_config_text(self, config_text: str) -> bool:
         """Validate Loki config by writing to a temp file and running verify."""

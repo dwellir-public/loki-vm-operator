@@ -498,12 +498,13 @@ def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
     assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
 
 
-def test_config_override_without_managed_ruler_contract_is_rejected(
+def test_legacy_config_override_without_ruler_contract_remains_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An override must not silently disable the ruler API managed by the charm."""
+    """Existing overrides remain valid when no relation-managed rules are requested."""
     ctx = _context()
     writes: list[str] = []
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
     monkeypatch.setattr(
         "charm.loki.write_config_text", lambda config_text, **_: writes.append(config_text)
     )
@@ -518,10 +519,71 @@ def test_config_override_without_managed_ruler_contract_is_rejected(
 
     state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
 
-    assert writes == []
-    assert state_out.unit_status == testing.WaitingStatus(
-        "config-override must enable the charm-managed ruler API; check logs"
+    assert writes == [config["config-override"].strip()]
+    assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
+
+
+def test_legacy_config_override_skips_requested_relation_rules_with_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relation rules opt in to a clear wait when a legacy override cannot manage them."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "auth_enabled: false\nserver:\n  http_listen_port: 3100\n",
+    }
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(config=config, leader=True, relations=[source, peer]),
     )
+
+    assert _FakeRulerApi.calls == []
+    assert state_out.unit_status == testing.WaitingStatus(
+        "config-override disables relation alert-rule reconciliation"
+    )
+
+
+def test_config_override_with_ruler_contract_reconciles_relation_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An override that supplies the contract retains managed rule behavior."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": (
+            "auth_enabled: false\nserver:\n  http_listen_port: 3100\n"
+            "ruler:\n  enable_api: true\n  rule_path: /var/lib/loki/ruler-tmp\n"
+            "ruler_storage:\n  backend: filesystem\n"
+        ),
+    }
+
+    ctx.run(
+        ctx.on.config_changed(),
+        testing.State(config=config, leader=True, relations=[source, peer]),
+    )
+
+    assert [group["name"] for group in _FakeRulerApi.calls[-1]] == ["source-group"]
 
 
 def test_generated_config_reports_unsupported_pre_3_4_loki(
