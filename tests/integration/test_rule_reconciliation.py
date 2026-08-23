@@ -19,9 +19,11 @@ jubilant = pytest.importorskip("jubilant")
 class _RecordingJuju:
     """Record transport calls for the non-live log-post regression."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, debug_logs: list[str] | None = None) -> None:
         self.ssh_calls: list[tuple[str, ...]] = []
         self.cli_calls: list[tuple[str, ...]] = []
+        self.model_config_calls: list[dict[str, str]] = []
+        self.debug_logs = iter(debug_logs or [""])
 
     def ssh(self, target: str, command: str, *args: str) -> str:
         self.ssh_calls.append((target, command, *args))
@@ -30,6 +32,15 @@ class _RecordingJuju:
     def cli(self, *args: str) -> str:
         self.cli_calls.append(args)
         return ""
+
+    def model_config(self, values: dict[str, str]) -> None:
+        """Record requested model configuration changes."""
+        self.model_config_calls.append(values)
+
+    def debug_log(self, *, limit: int = 0) -> str:
+        """Return the next configured Juju log snapshot."""
+        assert limit == 10_000
+        return next(self.debug_logs)
 
 
 class _ShowUnitJuju:
@@ -80,12 +91,21 @@ def test_remote_relation_value_reads_the_published_unit_contract() -> None:
     )
 
 
-def test_namespace_drift_replay_uses_owned_api_and_update_status_hook() -> None:
-    """The live replay helpers delete only owned state then trigger periodic convergence."""
-    juju = _RecordingJuju()
+def test_namespace_drift_replay_uses_owned_api_and_juju_managed_update_status() -> None:
+    """Delete only owned state and wait for a real Juju-managed periodic hook."""
+    marker = 'unit-loki-vm-0: ran "update-status" hook'
+    juju = _RecordingJuju(debug_logs=[marker, f"{marker}\n{marker}"])
 
+    _accelerate_periodic_reconciliation(juju)
+    previous = _completed_hook_count(juju, unit="loki-vm/0", hook="update-status")
     _delete_owned_namespace(juju)
-    _trigger_update_status(juju)
+    _wait_for_hook_completions(
+        juju,
+        unit="loki-vm/0",
+        hook="update-status",
+        previous=previous,
+        timeout=0,
+    )
 
     assert juju.ssh_calls == [
         (
@@ -97,7 +117,55 @@ def test_namespace_drift_replay_uses_owned_api_and_update_status_hook() -> None:
             "http://127.0.0.1:3100/loki/api/v1/rules/juju-loki-vm",
         )
     ]
-    assert juju.cli_calls == [("exec", "--unit", "loki-vm/0", "hooks/update-status")]
+    assert juju.cli_calls == []
+    assert juju.model_config_calls == [{"update-status-hook-interval": "1m"}]
+
+
+def test_live_suite_never_executes_a_hook_file_directly() -> None:
+    """Require Juju to provide hook context for periodic reconciliation."""
+    source = Path(__file__).read_text()
+    forbidden = "hooks/" + "update-status"
+
+    assert forbidden not in source
+
+
+def test_wait_for_rules_retries_transient_ruler_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relation mutation may briefly make the ruler endpoint unavailable."""
+
+    class FakeJuju:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ssh(self, *_args: str) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("ruler temporarily unavailable")
+            return "404 page not found\n404"
+
+    juju = FakeJuju()
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    _wait_for_rules(juju, [], timeout=1)
+
+    assert juju.calls == 2
+
+
+def test_wait_for_rules_treats_missing_owned_namespace_as_empty() -> None:
+    """Loki reports an absent namespace as HTTP 404 after successful withdrawal."""
+
+    class FakeJuju:
+        def ssh(self, *_args: str) -> str:
+            return "404 page not found\n404"
+
+    _wait_for_rules(FakeJuju(), [], timeout=0.1)
+
+
+def test_decode_rule_response_reads_status_suffix_without_shell_escapes() -> None:
+    """Juju's argv transport must not rely on a backslash-newline curl format."""
+    assert _decode_rule_response("juju-loki-vm: []\n200\n") == {"juju-loki-vm": []}
+    assert _decode_rule_response("404 page not found\n404\n") == {}
 
 
 def _remote_relation_value(juju: Any, *, unit: str, endpoint: str, key: str) -> str:
@@ -159,13 +227,22 @@ def _wait_for_rules(
     """Wait for exact deterministic group/alert order and preserved source labels."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        output = juju.ssh(
-            "loki-vm/0",
-            "curl",
-            "-fsS",
-            "http://127.0.0.1:3100/loki/api/v1/rules",
-        )
-        document = yaml.safe_load(output) or {}
+        try:
+            output = juju.ssh(
+                "loki-vm/0",
+                "curl",
+                "-sS",
+                "-w",
+                "%{http_code}",
+                "http://127.0.0.1:3100/loki/api/v1/rules",
+            )
+            document = _decode_rule_response(output)
+            if document is None:
+                time.sleep(5)
+                continue
+        except Exception:  # noqa: BLE001 - ruler mutation is eventually consistent live.
+            time.sleep(5)
+            continue
         actual = [
             (
                 str(group.get("name")),
@@ -179,6 +256,20 @@ def _wait_for_rules(
             return
         time.sleep(5)
     raise AssertionError(f"Loki did not load expected ordered rules: {expected}")
+
+
+def _decode_rule_response(output: str) -> dict[str, Any] | None:
+    """Decode a ruler response whose final three characters are its HTTP status."""
+    output = output.rstrip("\r\n")
+    if len(output) < 3:
+        return None
+    body, status = output[:-3], output[-3:]
+    if status == "404":
+        return {}
+    if status != "200":
+        return None
+    document = yaml.safe_load(body) or {}
+    return document if isinstance(document, dict) else None
 
 
 def _expected(group: str, alert: str, source: str) -> tuple[str, str, dict[str, str]]:
@@ -217,9 +308,39 @@ def _delete_owned_namespace(juju: Any, *, unit: str = "loki-vm/0") -> None:
     )
 
 
-def _trigger_update_status(juju: Any, *, unit: str = "loki-vm/0") -> None:
-    """Invoke the real periodic lifecycle hook to request rule replay."""
-    juju.cli("exec", "--unit", unit, "hooks/update-status")
+def _accelerate_periodic_reconciliation(juju: Any) -> None:
+    """Use Juju's real scheduler with a practical live-test interval."""
+    juju.model_config({"update-status-hook-interval": "1m"})
+
+
+def _completed_hook_count(juju: Any, *, unit: str, hook: str) -> int:
+    """Count completed hooks for one unit in the bounded controller log."""
+    entity = f"unit-{unit.replace('/', '-')}:"
+    completion = f'ran "{hook}" hook'
+    return sum(
+        entity in line and completion in line for line in juju.debug_log(limit=10_000).splitlines()
+    )
+
+
+def _wait_for_hook_completions(
+    juju: Any,
+    *,
+    unit: str,
+    hook: str,
+    previous: int,
+    additional: int = 1,
+    timeout: float = 180,
+) -> None:
+    """Wait for Juju to schedule and complete additional lifecycle hooks."""
+    deadline = time.monotonic() + timeout
+    while True:
+        completed = _completed_hook_count(juju, unit=unit, hook=hook)
+        if completed >= previous + additional:
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(5)
+    raise AssertionError(f"Juju did not complete {additional} additional {hook} hook(s)")
 
 
 def _assert_fresh_log_round_trip(juju: Any, *, timeout: float = 120) -> None:
@@ -254,6 +375,7 @@ def test_two_relation_snapshots_reach_ruler_without_breaking_logs(
     rule_provider_charm: Path,
 ) -> None:
     """Load two app snapshots through the real relation, ruler API, and Loki process."""
+    _accelerate_periodic_reconciliation(juju)
     juju.deploy(charm.resolve(), app="loki-vm")
     juju.deploy(
         rule_provider_charm.resolve(),
@@ -355,9 +477,19 @@ def test_two_relation_snapshots_reach_ruler_without_breaking_logs(
     _wait_for_rules(juju, [_expected("source-a-updated", "SourceAUpdatedAlert", "a")])
     juju.ssh("loki-vm/0", "sudo", "systemctl", "restart", "loki")
     _wait_for_rules(juju, [_expected("source-a-updated", "SourceAUpdatedAlert", "a")])
+    previous_update_status = _completed_hook_count(
+        juju,
+        unit="loki-vm/0",
+        hook="update-status",
+    )
     _delete_owned_namespace(juju)
     _wait_for_rules(juju, [])
-    _trigger_update_status(juju)
+    _wait_for_hook_completions(
+        juju,
+        unit="loki-vm/0",
+        hook="update-status",
+        previous=previous_update_status,
+    )
     _wait_for_rules(juju, [_expected("source-a-updated", "SourceAUpdatedAlert", "a")])
     _assert_relation_contracts(juju, relation_contracts)
     _assert_fresh_log_round_trip(juju)

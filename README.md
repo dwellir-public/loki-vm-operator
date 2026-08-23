@@ -98,14 +98,17 @@ reports a clear waiting status.
 
 Each relation document must be strictly below 60 KiB. The charm also bounds
 JSON depth, node count, group-name bytes, cache size, the number of admitted
-source relations, and aggregate group/rule and ruler-API work. One apply has a
-fixed total deadline; if a timed-out write has mutated Loki, restoration of the
-captured namespace receives a separate bounded recovery deadline. Mutation
-responses are streamed, size-limited, and always closed. A reconciliation has
-an explicit 2,054-operation and 120-second structural ceiling, including at
-most one compensating replace. A malformed or over-limit update retains that
-relation's last-known-good snapshot while valid sibling relations continue. Valid omission
-or relation removal withdraws owned groups.
+source relations, and aggregate group/rule and ruler-API work. Each ruler API
+request has bounded connect and read-inactivity timeouts; if a timed-out write
+has mutated Loki, restoration of the captured namespace receives a fresh
+bounded request budget. Mutation responses are streamed, size-limited, and
+always closed. A reconciliation has an explicit 2,054-operation structural
+ceiling, including at most one compensating replace. On the trusted model
+network, a normally responsive peer is also bounded by the 30-second apply and
+recovery budgets; a peer that continuously trickles response bytes can extend
+wall-clock time beyond those budgets. A malformed or over-limit update retains
+that relation's last-known-good snapshot while valid sibling relations continue.
+Valid omission or relation removal withdraws owned groups.
 
 The `replicas` application databag stores a bounded compressed cache containing
 per-relation snapshots and the last accepted rendered state. This supports

@@ -372,16 +372,47 @@ def _expected_rules() -> list[tuple[str, str, dict[str, str]]]:
 
 
 def _rule_tuples(document: dict[str, Any]) -> list[tuple[str, str, dict[str, str]]]:
-    """Extract deterministic group, alert, and source-label tuples."""
+    """Extract deterministic tuples from Loki's namespace-keyed API response."""
+    groups = document.get(NAMESPACE, [])
+    if not isinstance(groups, list):
+        return []
     return [
         (
             str(group.get("name")),
             str(rule.get("alert") or rule.get("name")),
             {str(key): str(value) for key, value in rule.get("labels", {}).items()},
         )
-        for group in document.get("groups", [])
+        for group in groups
         for rule in group.get("rules", [])
     ]
+
+
+def test_rule_tuples_reads_loki_namespace_envelope_in_order() -> None:
+    """Model Loki 3.4's namespace-keyed response, including stable group order."""
+    document = {
+        NAMESPACE: [
+            {
+                "name": "source-a",
+                "rules": [
+                    {
+                        "alert": "SourceAAlert",
+                        "labels": {"severity": "a-warning", "source": "a"},
+                    }
+                ],
+            },
+            {
+                "name": "source-b",
+                "rules": [
+                    {
+                        "alert": "SourceBAlert",
+                        "labels": {"severity": "b-warning", "source": "b"},
+                    }
+                ],
+            },
+        ]
+    }
+
+    assert _rule_tuples(document) == _expected_rules()
 
 
 def _wait_for_namespace(

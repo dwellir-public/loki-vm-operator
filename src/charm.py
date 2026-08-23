@@ -256,6 +256,7 @@ class LokiVmCharm(ops.CharmBase):
 
     def _on_loki_alert_rules_changed(self, event: ops.EventBase) -> None:
         """Reconcile standard provider alert-rule changes into Loki's ruler."""
+        self._refresh_loki_provider_endpoint()
         self._reconcile_rules()
 
     def _on_loki_push_api_relation_broken(self, event: ops.RelationBrokenEvent) -> None:

@@ -408,6 +408,33 @@ def test_relation_changed_with_omitted_rules_withdraws_snapshot(
     assert _FakeRulerApi.calls[-1] == []
 
 
+def test_rule_relation_changed_republishes_configured_push_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restore the charm-selected ingest URL after the provider library handles rule changes."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    published_urls: list[str] = []
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr(
+        "charm.LokiPushApiProvider.update_endpoint",
+        lambda _self, url="", relation=None: published_urls.append(url),
+    )
+
+    ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(
+            leader=True,
+            relations=[source, peer],
+            config={"external-url": "logs.example.com"},
+        ),
+    )
+
+    assert published_urls[-1] == "http://logs.example.com:3100"
+
+
 def test_leader_election_with_empty_state_cleans_owned_namespace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

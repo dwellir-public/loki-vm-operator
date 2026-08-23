@@ -24,4 +24,5 @@ jobs:
           uv sync --group dev
           uv run tox -e format
           uv run tox -e lint
+          uv run tox -e static
           uv run tox -e unit

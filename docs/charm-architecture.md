@@ -75,15 +75,19 @@ default path so upstream Loki expectations still hold. Generated config is writt
 `src/rule_reconciler.py` validates relation JSON, enforces the sub-60-KiB value limit and bounded
 tree/work limits, and deterministically merges groups by relation ID and group name. It preserves
 expressions, names, and labels. At most 32 source relations are admitted, and explicit aggregate
-group/rule, HTTP-operation, response-stream, and total apply-deadline limits bound ruler work. The leader owns the
-single `juju-loki-vm` namespace through Loki's supported ruler HTTP API; unchanged state is not
-rewritten, while updates and removals use group YAML requests. Mutation responses
+group/rule, HTTP-operation, response-stream, and per-request connect/read-inactivity limits bound
+ruler work. The leader owns the single `juju-loki-vm` namespace through Loki's supported ruler
+HTTP API; unchanged state is not rewritten, while updates and removals use group YAML requests. Mutation responses
 are streamed, bounded, and closed. A failed or expired candidate write restores
 the captured pre-apply namespace under an independent bounded recovery budget,
-so an exhausted candidate deadline cannot prevent rollback. A structured apply
+so an exhausted candidate request budget cannot prevent rollback. A structured apply
 failure records whether that recovery completed, avoiding redundant replay; at
 most one compensating replace remains, for a structural ceiling of 2,054 HTTP
-operations and 120 seconds per reconciliation.
+operations. On the trusted model network, normally responsive requests are
+also bounded by the 30-second apply and recovery budgets. Because the HTTP
+client timeout bounds connect and read inactivity rather than total transfer
+time, a peer that continuously trickles bytes can exceed those wall-clock
+budgets.
 
 The `replicas` application databag contains a versioned, compressed, bounded cache of each
 relation's last-known-good snapshot plus the last accepted aggregate. Malformed sources are
