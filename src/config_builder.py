@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 HTTP_LISTEN_PORT = 3100
+MINIMUM_THANOS_OBJSTORE_VERSION = (3, 4, 0)
 
 DEFAULT_CONFIG_DIR = "/etc/loki"
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.yml")
@@ -60,6 +61,7 @@ class ConfigBuilder:
         datasource_uid: Optional[str] = None,
         memberlist_join_members: Optional[List[str]] = None,
         s3: Optional[S3StorageConfig] = None,
+        loki_version: Optional[str] = None,
     ):
         """Init method."""
         self.instance_addr = instance_addr
@@ -74,16 +76,25 @@ class ConfigBuilder:
         self.datasource_uid = datasource_uid
         self.memberlist_join_members = memberlist_join_members
         self.s3 = s3
+        self.loki_version = loki_version
 
         self.data_dir = data_dir
         self.chunks_dir = os.path.join(self.data_dir, "chunks")
         self.rules_dir = os.path.join(self.data_dir, "rules")
+        self.ruler_tmp_dir = os.path.join(self.data_dir, "ruler-tmp")
         self.compactor_dir = os.path.join(self.data_dir, "compactor")
         self.tsdb_dir = os.path.join(self.data_dir, "tsdb-index")
         self.tsdb_cache_dir = os.path.join(self.data_dir, "tsdb-cache")
 
     def build(self) -> dict:
         """Build Loki config dictionary."""
+        if (
+            self.loki_version
+            and self._version_tuple(self.loki_version) < MINIMUM_THANOS_OBJSTORE_VERSION
+        ):
+            raise ValueError(
+                f"Loki >= 3.4.0 is required for managed ruler storage; found {self.loki_version}"
+            )
         loki_config = {
             "target": self._target,
             "auth_enabled": self._auth_enabled,
@@ -98,6 +109,7 @@ class ConfigBuilder:
             "frontend": self._frontend,
             "querier": self._querier,
             "compactor": self._compactor,
+            "ruler_storage": self._ruler_storage,
         }
 
         if memberlist := self._memberlist:
@@ -111,6 +123,12 @@ class ConfigBuilder:
             loki_config["analytics"] = self._analytics
 
         return loki_config
+
+    @staticmethod
+    def _version_tuple(version: str) -> tuple[int, int, int]:
+        """Normalize the numeric workload version reported by Loki."""
+        values = [int(value) for value in version.split(".")[:3]]
+        return tuple((values + [0, 0, 0])[:3])  # type: ignore[return-value]
 
     @property
     def _common(self) -> dict:
@@ -142,18 +160,49 @@ class ConfigBuilder:
         }
 
     @property
-    def _ruler(self) -> Optional[dict]:
-        if not self.alertmanager_url:
-            return None
-        ruler_config = {
-            "alertmanager_url": self.alertmanager_url,
-            "enable_alertmanager_v2": True,
-        }
+    def _ruler(self) -> dict:
+        """Enable the writable ruler API independently of Alertmanager delivery."""
+        ruler_config = {"enable_api": True, "rule_path": self.ruler_tmp_dir}
+        if self.alertmanager_url:
+            ruler_config.update(
+                {
+                    "alertmanager_url": self.alertmanager_url,
+                    "enable_alertmanager_v2": True,
+                }
+            )
         if self.datasource_uid:
             ruler_config["datasource_uid"] = self.datasource_uid
         if self.grafana_external_url:
             ruler_config["external_url"] = self.grafana_external_url
         return ruler_config
+
+    @property
+    def _ruler_storage(self) -> dict:
+        """Use shared S3 rule storage in clustered mode and durable local storage otherwise."""
+        if self.s3 is None:
+            return {
+                "backend": "filesystem",
+                "filesystem": {"dir": self.rules_dir},
+            }
+        return {
+            "backend": "s3",
+            "storage_prefix": "ruler",
+            "s3": self._thanos_s3,
+        }
+
+    @property
+    def _thanos_s3(self) -> dict:
+        """Render the path-style Thanos S3 client shared by chunks and rules."""
+        assert self.s3 is not None
+        return {
+            "bucket_name": self.s3.bucket,
+            "endpoint": self.s3.endpoint,
+            "access_key_id": self.s3.access_key_id,
+            "secret_access_key": self.s3.secret_access_key,
+            "region": self.s3.region,
+            "insecure": self.s3.insecure,
+            "bucket_lookup_type": "path",
+        }
 
     @property
     def _schema_config(self) -> dict:
@@ -199,23 +248,19 @@ class ConfigBuilder:
     @property
     def _storage_config(self) -> dict:
         storage_config: dict[str, object] = {
+            # Select the writable `ruler_storage` backend. Keep chunk/index
+            # storage in the matching Thanos schema so this global switch never
+            # falls back to an unconfigured object-store client.
+            "use_thanos_objstore": True,
             "tsdb_shipper": {
                 "active_index_directory": self.tsdb_dir,
                 "cache_location": self.tsdb_cache_dir,
-            }
+            },
         }
         if self.s3 is None:
-            storage_config["filesystem"] = {"directory": self.chunks_dir}
+            storage_config["object_store"] = {"filesystem": {"dir": self.chunks_dir}}
             return storage_config
-        storage_config["aws"] = {
-            "bucketnames": self.s3.bucket,
-            "endpoint": self.s3.endpoint,
-            "region": self.s3.region,
-            "access_key_id": self.s3.access_key_id,
-            "secret_access_key": self.s3.secret_access_key,
-            "insecure": self.s3.insecure,
-            "s3forcepathstyle": True,
-        }
+        storage_config["object_store"] = {"s3": self._thanos_s3}
         return storage_config
 
     @property

@@ -32,6 +32,15 @@ from config_builder import (
     ConfigBuilder,
     S3StorageConfig,
 )
+from rule_reconciler import (
+    CACHE_KEY as RULE_CACHE_KEY,
+)
+from rule_reconciler import (
+    LokiRulerApiClient,
+    LokiRuleReconciler,
+    RelationRuleSource,
+    prepare_filesystem_rule_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +97,7 @@ class LokiVmCharm(ops.CharmBase):
             data_dir=DEFAULT_DATA_DIR,
             last_good_config="",
             last_failed_config_path="",
+            configuration_error="",
             config_drifted=False,
             peer_addresses_json="",
         )
@@ -122,6 +132,7 @@ class LokiVmCharm(ops.CharmBase):
         framework.observe(self.on.config_changed, self._on_config_changed)
         framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
         framework.observe(self.on.update_status, self._on_update_status)
+        framework.observe(self.on.leader_elected, self._on_leader_elected)
         framework.observe(self.on.cluster_health_action, self._on_cluster_health_action)
         framework.observe(self.ingress.on.ready_for_unit, self._on_ingress_changed)
         framework.observe(self.ingress.on.revoked_for_unit, self._on_ingress_changed)
@@ -170,6 +181,18 @@ class LokiVmCharm(ops.CharmBase):
         framework.observe(self.on.replicas_relation_joined, self._on_replicas_changed)
         framework.observe(self.on.replicas_relation_changed, self._on_replicas_changed)
         framework.observe(self.on.replicas_relation_departed, self._on_replicas_changed)
+        framework.observe(
+            self.on.loki_push_api_relation_changed,
+            self._on_loki_alert_rules_changed,
+        )
+        framework.observe(
+            self.on.loki_push_api_relation_broken,
+            self._on_loki_push_api_relation_broken,
+        )
+        framework.observe(
+            self.on.loki_push_api_relation_departed,
+            self._on_loki_push_api_relation_departed,
+        )
 
     def _on_install(self, event: ops.InstallEvent):
         """Install the workload and preserve the package default config."""
@@ -194,6 +217,10 @@ class LokiVmCharm(ops.CharmBase):
             self.unit.status = self._invalid_config_status()
             return
         loki.start()
+        if not self._wait_for_single_unit_ready():
+            return
+        if not self._reconcile_rules():
+            return
         version = loki.get_version()
         if version is not None:
             self.unit.set_workload_version(version)
@@ -205,8 +232,8 @@ class LokiVmCharm(ops.CharmBase):
         self._reconcile_runtime(status_message="configuring Loki")
 
     def _on_upgrade_charm(self, event: ops.UpgradeCharmEvent) -> None:
-        """Handle charm upgrade without restarting or rewriting configuration."""
-        logger.info("Upgrade-charm event: skipping config rewrite and restart.")
+        """Apply required config changes and replay accepted rules on upgrade."""
+        self._reconcile_runtime(status_message="upgrading Loki charm")
 
     def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
         """Handle periodic status updates (detect drift and workload health)."""
@@ -221,6 +248,24 @@ class LokiVmCharm(ops.CharmBase):
         if not self._stored.config_drifted:
             self._reconcile_rolling_restart()
             self.unit.status = self._runtime_health_status()
+            self._reconcile_rules()
+
+    def _on_leader_elected(self, event: ops.LeaderElectedEvent) -> None:
+        """Replay leader-shared accepted rules after leadership changes."""
+        self._reconcile_rules()
+
+    def _on_loki_alert_rules_changed(self, event: ops.EventBase) -> None:
+        """Reconcile standard provider alert-rule changes into Loki's ruler."""
+        self._refresh_loki_provider_endpoint()
+        self._reconcile_rules()
+
+    def _on_loki_push_api_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
+        """Withdraw the broken relation even while Juju still exposes stale data."""
+        self._reconcile_rules(excluded_relation_id=event.relation.id)
+
+    def _on_loki_push_api_relation_departed(self, event: ops.RelationDepartedEvent) -> None:
+        """Re-evaluate app-owned rules after a remote unit departs."""
+        self._reconcile_rules()
 
     def _on_ingress_changed(self, event: ops.EventBase) -> None:
         """Handle ingress updates by refreshing the published endpoint."""
@@ -318,11 +363,52 @@ class LokiVmCharm(ops.CharmBase):
             if self._is_clustered_mode():
                 self._set_restart_pending(True)
             else:
-                self._restart_if_running()
+                restarted = self._restart_if_running()
+                if restarted and not self._wait_for_single_unit_ready():
+                    return
         self._reconcile_rolling_restart()
         self._set_workload_version()
         self._update_datasource_exchange()
         self.unit.status = self._runtime_health_status()
+        self._reconcile_rules()
+
+    def _reconcile_rules(self, *, excluded_relation_id: int | None = None) -> bool:
+        """Apply bounded relation rules and persist accepted state in peer app data."""
+        if not self._is_leader():
+            return True
+        peer = self._peer_relation()
+        if peer is None:
+            logger.warning("Cannot reconcile Loki rules until the replicas relation is available")
+            return True
+        sources = [
+            RelationRuleSource(
+                relation.id,
+                relation.data[relation.app].get("alert_rules"),
+            )
+            for relation in self.model.relations.get("loki_push_api", [])
+            if relation.id != excluded_relation_id and relation.app is not None
+        ]
+        cache_value = peer.data[self.app].get(RULE_CACHE_KEY)
+        override = str(self.config.get("config-override", "")).strip()
+        if override and not self._override_has_ruler_contract(override):
+            logger.warning(
+                "Skipping relation alert-rule reconciliation because config-override "
+                "does not provide the managed ruler API/storage contract"
+            )
+            if any(source.raw_payload is not None for source in sources) or cache_value:
+                self.unit.status = ops.WaitingStatus(
+                    "config-override disables relation alert-rule reconciliation"
+                )
+                return False
+            return True
+        client = LokiRulerApiClient("http://127.0.0.1:3100")
+        reconciler = LokiRuleReconciler(client)
+        reconciler.reconcile(
+            sources,
+            cache_value=cache_value,
+            persist=lambda value: peer.data[self.app].__setitem__(RULE_CACHE_KEY, value),
+        )
+        return True
 
     def _fast_reconcile_rolling_restart(self) -> None:
         """Advance rolling restart state without rewriting config."""
@@ -349,8 +435,15 @@ class LokiVmCharm(ops.CharmBase):
         - If valid, write the config + backup and update last-good config state.
         - Clear drift status after a successful apply.
         """
+        prepare_filesystem_rule_store(self.data_dir)
         loki.ensure_data_dir_permissions(self.data_dir)
-        config_text = self._render_config_text()
+        self._stored.configuration_error = ""
+        try:
+            config_text = self._render_config_text()
+        except (InvalidConfigurationError, ValueError) as exc:
+            logger.warning("Cannot render managed Loki configuration: %s", exc)
+            self._stored.configuration_error = str(exc)
+            return False, False
         if not config_text:
             return True, False
         if not self._validate_config_text(config_text):
@@ -379,6 +472,7 @@ class LokiVmCharm(ops.CharmBase):
         if self._stored.config_drifted:
             logger.info("Loki config drift resolved by applying charm configuration.")
         self._stored.config_drifted = False
+        self._stored.configuration_error = ""
         return True, True
 
     def _persist_failed_config(self, config_text: str) -> Path | None:
@@ -401,6 +495,8 @@ class LokiVmCharm(ops.CharmBase):
 
     def _invalid_config_status(self) -> ops.WaitingStatus:
         """Return a WaitingStatus message for invalid Loki config."""
+        if self._stored.configuration_error:
+            return ops.WaitingStatus(f"{self._stored.configuration_error}; check logs")
         if self._stored.last_failed_config_path:
             message = f"Invalid Loki config; check logs and {self._stored.last_failed_config_path}"
         else:
@@ -411,6 +507,10 @@ class LokiVmCharm(ops.CharmBase):
         """Return the Loki config as a YAML string."""
         override = str(self.config.get("config-override", "")).strip()
         if override:
+            if not self._override_has_ruler_contract(override):
+                logger.warning(
+                    "config-override does not enable relation alert-rule reconciliation"
+                )
             return override
         source_data = self._sorted_source_data()
         builder = ConfigBuilder(
@@ -424,9 +524,34 @@ class LokiVmCharm(ops.CharmBase):
             data_dir=self.data_dir,
             memberlist_join_members=self._memberlist_join_members(),
             s3=self._storage_backend_state().s3,
+            loki_version=loki.get_version(),
         )
         rendered = yaml.safe_dump(builder.build(), sort_keys=False)
         return f"{loki.GENERATED_CONFIG_HEADER}{rendered}"
+
+    @staticmethod
+    def _override_has_ruler_contract(override: str) -> bool:
+        """Return whether an override retains the local ruler contract used by the charm."""
+        try:
+            document = yaml.safe_load(override)
+        except yaml.YAMLError:
+            return False
+        if not isinstance(document, dict):
+            return False
+        ruler = document.get("ruler")
+        ruler_storage = document.get("ruler_storage")
+        server = document.get("server")
+        capable = (
+            document.get("auth_enabled") is False
+            and isinstance(server, dict)
+            and server.get("http_listen_port", 3100) == 3100
+            and isinstance(ruler, dict)
+            and ruler.get("enable_api") is True
+            and bool(ruler.get("rule_path"))
+            and isinstance(ruler_storage, dict)
+            and bool(ruler_storage.get("backend"))
+        )
+        return capable
 
     def _validate_config_text(self, config_text: str) -> bool:
         """Validate Loki config by writing to a temp file and running verify."""
@@ -515,11 +640,16 @@ class LokiVmCharm(ops.CharmBase):
         return "unknown"
 
     def _storage_probe_result(self, storage_state: StorageBackendState) -> tuple[bool, str | None]:
-        """Probe the configured storage backend when one is present."""
+        """Probe configured S3 endpoint reachability when one is present.
+
+        Loki readiness provides the authenticated bucket/configuration check. This
+        unauthenticated endpoint probe deliberately treats S3's expected HTTP 403
+        authentication challenge as proof that the configured service is reachable.
+        """
         if storage_state.s3 is None:
             return True, None
         scheme = "http" if storage_state.s3.insecure else "https"
-        return loki.check_endpoint(f"{scheme}://{storage_state.s3.endpoint}")
+        return loki.check_s3_endpoint(f"{scheme}://{storage_state.s3.endpoint}")
 
     def _rolling_phase(self, unit_name: str | None = None) -> str:
         """Return the stored rolling-restart phase for a unit."""
@@ -679,6 +809,16 @@ class LokiVmCharm(ops.CharmBase):
                 return
             time.sleep(1)
         raise RuntimeError(f"Timed out waiting for Loki readiness on {self.unit.name}")
+
+    def _wait_for_single_unit_ready(self) -> bool:
+        """Wait after a local start without turning a readiness timeout into a hook error."""
+        try:
+            self._wait_for_local_ready()
+        except RuntimeError as exc:
+            logger.warning("Loki did not become ready before the hook deadline: %s", exc)
+            self.unit.status = ops.MaintenanceStatus("waiting for Loki readiness")
+            return False
+        return True
 
     def _wait_for_cluster_healthy(self, *, timeout: int = 120) -> None:
         """Wait until the Loki cluster is healthy after a rolling restart step."""
@@ -846,16 +986,31 @@ class LokiVmCharm(ops.CharmBase):
     def _normalize_s3_endpoint(self, value: str) -> str:
         """Convert relation endpoint values into Loki's expected host:port format."""
         endpoint = value.strip().rstrip("/")
-        parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
-        if parsed.hostname is None:
+        try:
+            parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise InvalidConfigurationError(f"Invalid s3 endpoint {value!r}") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
             raise InvalidConfigurationError(f"Invalid s3 endpoint {value!r}")
         host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if ":" in host:
+            host = f"[{host}]"
         return f"{host}:{port}"
 
     def _s3_is_insecure(self, endpoint: str) -> bool:
         """Infer whether the S3 endpoint should use HTTP."""
-        return endpoint.strip().lower().startswith("http://")
+        normalized = endpoint.strip().lower()
+        return "://" not in normalized or normalized.startswith("http://")
 
     def _parse_bool(self, value: str, *, field_name: str) -> bool:
         """Parse a boolean relation field."""
@@ -874,13 +1029,15 @@ class LokiVmCharm(ops.CharmBase):
         if version is not None:
             self.unit.set_workload_version(version)
 
-    def _restart_if_running(self) -> None:
+    def _restart_if_running(self) -> bool:
         """Restart Loki after a config change when the workload is already installed."""
         if loki.is_active():
             loki.restart()
-            return
+            return True
         if loki.get_version() is not None:
             loki.start()
+            return True
+        return False
 
     def _refresh_loki_provider_endpoint(self) -> None:
         """Publish Loki push API endpoint to relation data."""

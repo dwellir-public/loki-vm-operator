@@ -119,6 +119,10 @@ config:
     config-override:
       description: |
         Full Loki configuration file as a string. When set, this overrides the
-        generated configuration entirely. Set to empty to revert to generated config.
+        generated configuration entirely. Existing overrides remain supported.
+        Relation alert-rule reconciliation is enabled only when the override
+        keeps auth disabled, listens on port 3100, enables the ruler API with a
+        rule path, and configures a ruler_storage backend. Set to empty to
+        revert to generated config.
       type: string
       default: ""

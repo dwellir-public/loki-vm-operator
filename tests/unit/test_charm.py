@@ -10,7 +10,9 @@ import pytest
 import yaml
 from ops import testing
 
-from charm import LokiVmCharm
+from charm import InvalidConfigurationError, LokiVmCharm, StorageBackendState
+from config_builder import S3StorageConfig
+from rule_reconciler import CACHE_KEY
 
 META = {
     "name": "loki-vm",
@@ -54,7 +56,7 @@ def _context() -> testing.Context:
 
 def mock_get_version():
     """Get a mock version string without executing the workload code."""
-    return "1.0.0"
+    return "3.4.0"
 
 
 def _s3_relation(
@@ -78,6 +80,108 @@ def _s3_relation(
     )
 
 
+def _rule_relation(name: str = "source", relation_id: int = 7) -> testing.Relation:
+    return testing.Relation(
+        "loki_push_api",
+        interface="loki_push_api",
+        id=relation_id,
+        remote_app_name=name,
+        remote_app_data={
+            "alert_rules": json.dumps(
+                {
+                    "groups": [
+                        {
+                            "name": f"{name}-group",
+                            "rules": [{"alert": "Example", "expr": '{job="demo"}'}],
+                        }
+                    ]
+                }
+            )
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("http://10.0.0.10:3900", "10.0.0.10:3900"),
+        ("https://s3.example.test", "s3.example.test:443"),
+        ("s3.example.test:3900", "s3.example.test:3900"),
+        ("http://[2001:db8::10]:3900", "[2001:db8::10]:3900"),
+        ("https://[2001:db8::10]", "[2001:db8::10]:443"),
+    ],
+)
+def test_normalize_s3_endpoint_preserves_valid_authority(
+    endpoint: str,
+    expected: str,
+) -> None:
+    assert LokiVmCharm._normalize_s3_endpoint(None, endpoint) == expected  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "ftp://s3.example.test:3900",
+        "http://s3.example.test:3900/prefix",
+        "http://s3.example.test:3900?query=value",
+        "http://user@s3.example.test:3900",
+    ],
+)
+def test_normalize_s3_endpoint_rejects_unsupported_url_components(endpoint: str) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        LokiVmCharm._normalize_s3_endpoint(None, endpoint)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        ("http://s3.example.test:3900", True),
+        ("https://s3.example.test:3900", False),
+        ("s3.example.test:3900", True),
+    ],
+)
+def test_s3_insecure_matches_normalization_default(endpoint: str, expected: bool) -> None:
+    assert LokiVmCharm._s3_is_insecure(None, endpoint) is expected  # type: ignore[arg-type]
+
+
+def test_storage_probe_treats_s3_auth_challenge_as_reachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    def probe(url: str) -> tuple[bool, None]:
+        seen.append(url)
+        return True, None
+
+    monkeypatch.setattr("charm.loki.check_s3_endpoint", probe)
+    state = StorageBackendState(
+        status=None,
+        s3=S3StorageConfig(
+            bucket="bucket",
+            endpoint="[2001:db8::10]:3900",
+            access_key_id="access",
+            secret_access_key="secret",
+            region="garage",
+            insecure=True,
+        ),
+    )
+
+    assert LokiVmCharm._storage_probe_result(None, state) == (True, None)  # type: ignore[arg-type]
+    assert seen == ["http://[2001:db8::10]:3900"]
+
+
+class _FakeRulerApi:
+    calls: list[list[dict]] = []
+    base_urls: list[str] = []
+
+    def __init__(self, base_url: str) -> None:
+        self.base_urls.append(base_url)
+
+    def replace_namespace(self, groups: list[dict]) -> list[dict]:
+        self.calls.append(groups)
+        return []
+
+
 @pytest.fixture(autouse=True)
 def _mock_workload_calls(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("charm.loki.is_active", lambda **_: False)
@@ -85,6 +189,7 @@ def _mock_workload_calls(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("charm.loki.start", lambda: None)
     monkeypatch.setattr("charm.loki.restart", lambda: None)
     monkeypatch.setattr("charm.loki.check_ready", lambda *_, **__: (True, None), raising=False)
+    monkeypatch.setattr("charm.prepare_filesystem_rule_store", lambda _: None)
 
 
 def test_start(monkeypatch: pytest.MonkeyPatch):
@@ -96,11 +201,297 @@ def test_start(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("charm.loki.start", lambda: None)
     monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
     monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._read_config_from_disk",
+        lambda self: self._render_config_text(),
+    )
     # Act:
     state_out = ctx.run(ctx.on.start(), testing.State())
     # Assert:
     assert state_out.workload_version is not None
     assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
+
+
+def test_start_waits_through_not_ready_then_reports_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Start should not calculate final health until local Loki becomes ready."""
+    ctx = _context()
+    readiness = iter([(False, "starting"), (True, None), (True, None)])
+    calls: list[str] = []
+    monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+
+    def check_ready(*_: object) -> tuple[bool, str | None]:
+        calls.append("check")
+        return next(readiness)
+
+    monkeypatch.setattr("charm.loki.check_ready", check_ready)
+    monkeypatch.setattr("charm.time.sleep", lambda _: None)
+
+    state_out = ctx.run(ctx.on.start(), testing.State())
+
+    assert calls == ["check", "check", "check"]
+    assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
+
+
+def test_start_readiness_timeout_retains_maintenance_without_hook_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded readiness timeout should remain retryable via later lifecycle events."""
+    ctx = _context()
+    moments = iter([0.0, 121.0])
+    monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr("charm.loki.check_ready", lambda *_: (False, "connection refused"))
+    monkeypatch.setattr("charm.time.monotonic", lambda: next(moments))
+
+    state_out = ctx.run(ctx.on.start(), testing.State())
+
+    assert state_out.unit_status == testing.MaintenanceStatus("waiting for Loki readiness")
+
+
+def test_single_unit_config_restart_waits_for_ready_but_unchanged_config_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a config-driven start or restart should incur the bounded readiness wait."""
+    ctx = _context()
+    waits: list[str] = []
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._read_config_from_disk",
+        lambda self: self._render_config_text(),
+    )
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._wait_for_local_ready",
+        lambda *_: waits.append("wait"),
+    )
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State())
+    assert waits == ["wait"]
+
+    state_out = ctx.run(ctx.on.config_changed(), state_out)
+    assert waits == ["wait"]
+    assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
+
+
+def test_single_unit_config_restart_timeout_retains_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config hooks should remain successful and retryable when restarted Loki is slow."""
+    ctx = _context()
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._wait_for_local_ready",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("timed out")),
+    )
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State())
+
+    assert state_out.unit_status == testing.MaintenanceStatus("waiting for Loki readiness")
+
+
+def test_storage_status_precedes_start_readiness_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blocking relation status must return before workload readiness handling."""
+    ctx = _context()
+    incomplete_s3 = testing.Relation(
+        "s3", interface="s3", remote_app_name="garage-vm", remote_app_data={}
+    )
+    monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
+    monkeypatch.setattr(
+        "charm.LokiVmCharm._wait_for_local_ready",
+        lambda *_: pytest.fail("readiness wait must not replace storage status"),
+    )
+
+    state_out = ctx.run(ctx.on.start(), testing.State(relations=[incomplete_s3]))
+
+    assert state_out.unit_status == testing.WaitingStatus("waiting for complete s3 relation data")
+
+
+def test_relation_rules_are_applied_and_cached_by_leader(monkeypatch: pytest.MonkeyPatch):
+    """A relation-changed event should reconcile standard alert_rules into Loki."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+
+    state_out = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(leader=True, relations=[source, peer]),
+    )
+
+    assert [[group["name"] for group in call] for call in _FakeRulerApi.calls][-1] == [
+        "source-group"
+    ]
+    assert len(_FakeRulerApi.calls) == 1
+    assert _FakeRulerApi.base_urls[-1] == "http://127.0.0.1:3100"
+    peer_out = next(
+        relation for relation in state_out.relations if relation.endpoint == "replicas"
+    )
+    assert peer_out.local_app_data[CACHE_KEY]
+
+
+def test_non_leader_never_applies_or_caches_relation_rules(monkeypatch: pytest.MonkeyPatch):
+    """Only the Juju leader may mutate shared rule state or the ruler namespace."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+
+    state_out = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(leader=False, relations=[source, peer]),
+    )
+
+    assert _FakeRulerApi.calls == []
+    peer_out = next(
+        relation for relation in state_out.relations if relation.endpoint == "replicas"
+    )
+    assert CACHE_KEY not in peer_out.local_app_data
+
+
+def test_broken_rule_relation_withdraws_its_groups(monkeypatch: pytest.MonkeyPatch):
+    """Relation-broken should exclude stale event data and clear the namespace."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    state = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(leader=True, relations=[source, peer]),
+    )
+    source_out = next(
+        relation for relation in state.relations if relation.endpoint == "loki_push_api"
+    )
+
+    ctx.run(ctx.on.relation_broken(source_out), state)
+
+    assert _FakeRulerApi.calls[-1] == []
+
+
+def test_relation_changed_with_omitted_rules_withdraws_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing alert_rules from an extant app databag must reconcile withdrawal."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    state = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(leader=True, relations=[source, peer]),
+    )
+    source_without_rules = testing.Relation(
+        "loki_push_api",
+        interface="loki_push_api",
+        id=source.id,
+        remote_app_name="source",
+        remote_app_data={},
+    )
+    peer_out = next(relation for relation in state.relations if relation.endpoint == "replicas")
+
+    ctx.run(
+        ctx.on.relation_changed(source_without_rules),
+        testing.State(leader=True, relations=[source_without_rules, peer_out]),
+    )
+
+    assert _FakeRulerApi.calls[-1] == []
+
+
+def test_rule_relation_changed_republishes_configured_push_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restore the charm-selected ingest URL after the provider library handles rule changes."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    published_urls: list[str] = []
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr(
+        "charm.LokiPushApiProvider.update_endpoint",
+        lambda _self, url="", relation=None: published_urls.append(url),
+    )
+
+    ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(
+            leader=True,
+            relations=[source, peer],
+            config={"external-url": "logs.example.com"},
+        ),
+    )
+
+    assert published_urls[-1] == "http://logs.example.com:3100"
+
+
+def test_leader_election_with_empty_state_cleans_owned_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty desired state must still delete stale charm-owned ruler state."""
+    ctx = _context()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+
+    ctx.run(ctx.on.leader_elected(), testing.State(leader=True, relations=[peer]))
+
+    assert _FakeRulerApi.calls == [[]]
+
+
+@pytest.mark.parametrize("event_name", ["start", "upgrade", "leader", "update-status"])
+def test_lifecycle_events_replay_relation_rules(
+    monkeypatch: pytest.MonkeyPatch,
+    event_name: str,
+):
+    """Lifecycle convergence should replay accepted relation rules after restarts or failover."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr(
+        "charm.loki.is_active", lambda **_: event_name in {"upgrade", "update-status"}
+    )
+    events = {
+        "start": ctx.on.start(),
+        "upgrade": ctx.on.upgrade_charm(),
+        "leader": ctx.on.leader_elected(),
+        "update-status": ctx.on.update_status(),
+    }
+
+    ctx.run(events[event_name], testing.State(leader=True, relations=[source, peer]))
+
+    assert any(group["name"] == "source-group" for call in _FakeRulerApi.calls for group in call)
+
+
+def test_departed_unit_keeps_remote_application_rules(monkeypatch: pytest.MonkeyPatch):
+    """A unit departure must not withdraw the remote application's app-owned rules."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+
+    ctx.run(
+        ctx.on.relation_departed(source, departing_unit=0),
+        testing.State(leader=True, relations=[source, peer]),
+    )
+
+    assert [group["name"] for group in _FakeRulerApi.calls[-1]] == ["source-group"]
 
 
 def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
@@ -119,13 +510,126 @@ def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
         "retention-period": 0,
         "reporting-enabled": True,
         "external-url": "",
-        "config-override": "auth_enabled: false\nserver:\n  http_listen_port: 3100\n",
+        "config-override": (
+            "auth_enabled: false\n"
+            "server:\n  http_listen_port: 3100\n"
+            "ruler:\n  enable_api: true\n  rule_path: /var/lib/loki/ruler-tmp\n"
+            "ruler_storage:\n  backend: filesystem\n"
+            "  filesystem:\n    dir: /var/lib/loki/rules\n"
+        ),
     }
 
     state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
 
     assert "auth_enabled: false" in seen["config"]
     assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
+
+
+def test_legacy_config_override_without_ruler_contract_remains_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing overrides remain valid when no relation-managed rules are requested."""
+    ctx = _context()
+    writes: list[str] = []
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr(
+        "charm.loki.write_config_text", lambda config_text, **_: writes.append(config_text)
+    )
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "auth_enabled: false\nserver:\n  http_listen_port: 3100\n",
+    }
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
+
+    assert writes == [config["config-override"].strip()]
+    assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
+
+
+def test_legacy_config_override_skips_requested_relation_rules_with_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relation rules opt in to a clear wait when a legacy override cannot manage them."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "auth_enabled: false\nserver:\n  http_listen_port: 3100\n",
+    }
+
+    state_out = ctx.run(
+        ctx.on.config_changed(),
+        testing.State(config=config, leader=True, relations=[source, peer]),
+    )
+
+    assert _FakeRulerApi.calls == []
+    assert state_out.unit_status == testing.WaitingStatus(
+        "config-override disables relation alert-rule reconciliation"
+    )
+
+
+def test_config_override_with_ruler_contract_reconciles_relation_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An override that supplies the contract retains managed rule behavior."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": (
+            "auth_enabled: false\nserver:\n  http_listen_port: 3100\n"
+            "ruler:\n  enable_api: true\n  rule_path: /var/lib/loki/ruler-tmp\n"
+            "ruler_storage:\n  backend: filesystem\n"
+        ),
+    }
+
+    ctx.run(
+        ctx.on.config_changed(),
+        testing.State(config=config, leader=True, relations=[source, peer]),
+    )
+
+    assert [group["name"] for group in _FakeRulerApi.calls[-1]] == ["source-group"]
+
+
+def test_generated_config_reports_unsupported_pre_3_4_loki(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Charm upgrades must not write Thanos config to an older installed Loki."""
+    ctx = _context()
+    writes: list[str] = []
+    monkeypatch.setattr("charm.loki.get_version", lambda: "3.3.2")
+    monkeypatch.setattr(
+        "charm.loki.write_config_text", lambda config_text, **_: writes.append(config_text)
+    )
+
+    state_out = ctx.run(ctx.on.upgrade_charm(), testing.State())
+
+    assert writes == []
+    assert state_out.unit_status == testing.WaitingStatus(
+        "Loki >= 3.4.0 is required for managed ruler storage; found 3.3.2; check logs"
+    )
 
 
 def test_invalid_config_keeps_last_good(monkeypatch: pytest.MonkeyPatch):
@@ -187,7 +691,12 @@ def test_config_drift_sets_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path
         "retention-period": 0,
         "reporting-enabled": True,
         "external-url": "",
-        "config-override": "auth_enabled: false\n",
+        "config-override": (
+            "auth_enabled: false\n"
+            "server:\n  http_listen_port: 3100\n"
+            "ruler:\n  enable_api: true\n  rule_path: /var/lib/loki/ruler-tmp\n"
+            "ruler_storage:\n  backend: filesystem\n"
+        ),
     }
 
     state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
@@ -803,11 +1312,41 @@ def test_s3_relation_renders_garage_backed_config(monkeypatch: pytest.MonkeyPatc
     config_yaml = yaml.safe_load(rendered)
 
     assert config_yaml["schema_config"]["configs"][0]["object_store"] == "s3"
-    assert config_yaml["storage_config"]["aws"]["bucketnames"] == "juju-s3-rel-10"
-    assert config_yaml["storage_config"]["aws"]["endpoint"] == "10.0.0.10:3900"
-    assert config_yaml["storage_config"]["aws"]["s3forcepathstyle"] is True
+    s3 = config_yaml["storage_config"]["object_store"]["s3"]
+    assert s3["bucket_name"] == "juju-s3-rel-10"
+    assert s3["endpoint"] == "10.0.0.10:3900"
+    assert s3["bucket_lookup_type"] == "path"
+    assert "aws" not in config_yaml["storage_config"]
     assert config_yaml["compactor"]["working_directory"].endswith("compactor")
     assert isinstance(state_out.unit_status, testing.ActiveStatus)
+
+
+def test_s3_relation_renders_bracketed_ipv6_for_loki_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both Thanos and legacy AWS clients require a bracketed IPv6 authority."""
+    ctx = _context()
+    seen: dict[str, str] = {}
+
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr(
+        "charm.loki.write_config_text",
+        lambda config_text, **_: seen.update(config=config_text),
+    )
+    ctx.run(
+        ctx.on.config_changed(),
+        testing.State(
+            relations=[_s3_relation(endpoint="http://[2001:db8::10]:3900")],
+            planned_units=1,
+        ),
+    )
+
+    rendered = "\n".join(line for line in seen["config"].splitlines() if not line.startswith("#"))
+    config_yaml = yaml.safe_load(rendered)
+    assert config_yaml["storage_config"]["object_store"]["s3"]["endpoint"] == (
+        "[2001:db8::10]:3900"
+    )
+    assert config_yaml["ruler_storage"]["s3"]["endpoint"] == "[2001:db8::10]:3900"
 
 
 @pytest.mark.parametrize("provider_name", ["garage-vm", "s3-integrator"])
@@ -831,8 +1370,10 @@ def test_s3_provider_parity(monkeypatch: pytest.MonkeyPatch, provider_name: str)
     config_yaml = yaml.safe_load(rendered)
 
     assert config_yaml["schema_config"]["configs"][0]["object_store"] == "s3"
-    assert config_yaml["storage_config"]["aws"]["endpoint"] == "10.0.0.10:3900"
-    assert config_yaml["storage_config"]["aws"]["bucketnames"] == "juju-s3-rel-10"
+    s3 = config_yaml["storage_config"]["object_store"]["s3"]
+    assert s3["endpoint"] == "10.0.0.10:3900"
+    assert s3["bucket_name"] == "juju-s3-rel-10"
+    assert s3["bucket_lookup_type"] == "path"
     assert isinstance(state_out.unit_status, testing.ActiveStatus)
 
 
