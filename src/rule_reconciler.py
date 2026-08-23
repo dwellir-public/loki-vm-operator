@@ -50,8 +50,9 @@ MAX_CACHE_NODES = MAX_SOURCE_RELATIONS * MAX_DOCUMENT_NODES + 128
 CACHE_VERSION = 1
 CACHE_KEY = "_loki_rule_reconciler_state_v1"
 MAX_APPLY_SECONDS = 30
-# GET plus a full candidate replacement and worst-case full rollback.
-MAX_API_OPERATIONS = 1 + 2 * (1 + MAX_TOTAL_GROUPS)
+MAX_MUTATION_API_OPERATIONS = 1 + MAX_TOTAL_GROUPS
+# One read plus a full candidate mutation and worst-case full recovery.
+MAX_API_OPERATIONS = 1 + 2 * MAX_MUTATION_API_OPERATIONS
 
 
 class InvalidRuleSnapshotError(ValueError):
@@ -481,7 +482,7 @@ class _ApplyBudget:
 
     deadline: float
     clock: Callable[[], float]
-    operations_remaining: int = MAX_API_OPERATIONS
+    operations_remaining: int
 
     def request_timeout(self, configured_timeout: int) -> float:
         """Reserve one operation and return its bounded remaining timeout."""
@@ -504,6 +505,7 @@ class LokiRulerApiClient:
 
     NAMESPACE = "juju-loki-vm"
     MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+    MAX_WRITE_RESPONSE_BYTES = 64 * 1024
 
     def __init__(
         self,
@@ -521,7 +523,11 @@ class LokiRulerApiClient:
 
     def replace_namespace(self, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Replace transactionally and return validated state for caller rollback."""
-        budget = _ApplyBudget(deadline=self._clock() + MAX_APPLY_SECONDS, clock=self._clock)
+        budget = _ApplyBudget(
+            deadline=self._clock() + MAX_APPLY_SECONDS,
+            clock=self._clock,
+            operations_remaining=1 + MAX_MUTATION_API_OPERATIONS,
+        )
         desired = copy.deepcopy(groups)
         _validate_tree(desired, max_nodes=MAX_CACHE_NODES)
         for group in desired:
@@ -534,7 +540,12 @@ class LokiRulerApiClient:
             self._write_namespace(desired, budget)
         except Exception:
             try:
-                self._write_namespace(current, budget)
+                recovery_budget = _ApplyBudget(
+                    deadline=self._clock() + MAX_APPLY_SECONDS,
+                    clock=self._clock,
+                    operations_remaining=MAX_MUTATION_API_OPERATIONS,
+                )
+                self._write_namespace(current, recovery_budget)
             except Exception as rollback_error:  # noqa: BLE001
                 logger.warning("Failed to roll back the Loki ruler namespace: %s", rollback_error)
             raise
@@ -599,7 +610,7 @@ class LokiRulerApiClient:
         if isinstance(document, dict) and isinstance(document.get("groups"), list):
             return document["groups"]
         if isinstance(document, dict):
-            return []
+            raise InvalidRuleSnapshotError("Loki ruler namespace response is unrecognized")
         raise InvalidRuleSnapshotError("Loki ruler response structure is invalid")
 
     def _write_namespace(self, groups: list[dict[str, Any]], budget: _ApplyBudget) -> None:
@@ -608,10 +619,13 @@ class LokiRulerApiClient:
             "DELETE",
             self._namespace_url,
             timeout=budget.request_timeout(self._timeout),
+            stream=True,
         )
-        budget.check_deadline()
-        if delete_response.status_code not in {200, 202, 204, 404}:
-            delete_response.raise_for_status()
+        self._finish_write_response(
+            delete_response,
+            accepted_statuses={200, 202, 204, 404},
+            budget=budget,
+        )
         for group in groups:
             body = yaml.safe_dump(group, sort_keys=False)
             response = self._session.request(
@@ -620,10 +634,37 @@ class LokiRulerApiClient:
                 data=body,
                 headers={"Content-Type": "application/yaml"},
                 timeout=budget.request_timeout(self._timeout),
+                stream=True,
             )
+            self._finish_write_response(
+                response,
+                accepted_statuses={200, 202, 204},
+                budget=budget,
+            )
+
+    def _finish_write_response(
+        self,
+        response: Any,
+        *,
+        accepted_statuses: set[int],
+        budget: _ApplyBudget,
+    ) -> None:
+        """Bound and close one streamed ruler mutation response."""
+        try:
             budget.check_deadline()
-            if response.status_code not in {200, 202, 204}:
+            received = 0
+            for chunk in response.iter_content(chunk_size=16 * 1024):
+                budget.check_deadline()
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > self.MAX_WRITE_RESPONSE_BYTES:
+                    raise InvalidRuleSnapshotError("Loki ruler write response exceeds safe bounds")
+            budget.check_deadline()
+            if response.status_code not in accepted_statuses:
                 response.raise_for_status()
+        finally:
+            response.close()
 
     @staticmethod
     def _canonical(groups: list[dict[str, Any]]) -> str:

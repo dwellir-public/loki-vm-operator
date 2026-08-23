@@ -44,6 +44,12 @@ chunk/index storage and ruler storage: local paths stay under the same data
 directory, while S3 keeps the same bucket, endpoint, credentials, and path-style
 lookup. This avoids selecting the new ruler client while leaving the log data
 plane on an inactive legacy storage block.
+This generated configuration has an explicit Loki 3.4.0 minimum because that
+release introduced `use_thanos_objstore`. Charm refresh intentionally does not
+upgrade the APT workload: a known older installed version retains its last-good
+configuration and produces a waiting status. A custom override may support a
+different Loki version, but it must explicitly preserve the ruler API/storage
+contract described above or the charm rejects it before writing.
 
 ## Relation Flows
 
@@ -70,7 +76,10 @@ tree/work limits, and deterministically merges groups by relation ID and group n
 expressions, names, and labels. At most 32 source relations are admitted, and explicit aggregate
 group/rule, HTTP-operation, response-stream, and total apply-deadline limits bound ruler work. The leader owns the
 single `juju-loki-vm` namespace through Loki's supported ruler HTTP API; unchanged state is not
-rewritten, while updates and removals use group YAML requests.
+rewritten, while updates and removals use group YAML requests. Mutation responses
+are streamed, bounded, and closed. A failed or expired candidate write restores
+the captured pre-apply namespace under an independent bounded recovery budget,
+so an exhausted candidate deadline cannot prevent rollback.
 
 The `replicas` application databag contains a versioned, compressed, bounded cache of each
 relation's last-known-good snapshot plus the last accepted aggregate. Malformed sources are

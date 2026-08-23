@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -68,7 +69,7 @@ def baseline_charm() -> pathlib.Path:
     """Return the baseline Loki charm used by the S3 migration test."""
     configured = os.environ.get("BASELINE_CHARM_PATH")
     if not configured:
-        pytest.skip("Set BASELINE_CHARM_PATH to run the S3 migration test")
+        raise pytest.UsageError("Set BASELINE_CHARM_PATH to run the S3 migration test")
     path = pathlib.Path(configured)
     if not path.exists():
         raise FileNotFoundError(f"Baseline charm does not exist: {path}")
@@ -80,11 +81,25 @@ def garage_charm() -> pathlib.Path:
     """Return the locally built Garage charm used by the S3 migration test."""
     configured = os.environ.get("GARAGE_CHARM_PATH")
     if not configured:
-        pytest.skip("Set GARAGE_CHARM_PATH to run the S3 migration test")
+        raise pytest.UsageError("Set GARAGE_CHARM_PATH to run the S3 migration test")
     path = pathlib.Path(configured)
     if not path.exists():
         raise FileNotFoundError(f"Garage charm does not exist: {path}")
     return path
+
+
+@pytest.fixture(scope="session")
+def baseline_loki_version() -> str:
+    """Return the explicitly pinned workload version expected from the baseline charm."""
+    configured = os.environ.get("BASELINE_LOKI_VERSION")
+    if not configured:
+        raise pytest.UsageError("Set BASELINE_LOKI_VERSION to run the S3 migration test")
+    if re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+){0,2}", configured) is None:
+        raise pytest.UsageError("BASELINE_LOKI_VERSION must be a numeric Loki version")
+    parts = tuple(int(part) for part in configured.split("."))
+    if (parts + (0, 0, 0))[:3] < (3, 4, 0):
+        raise pytest.UsageError("BASELINE_LOKI_VERSION must be 3.4.0 or newer")
+    return configured
 
 
 @pytest.fixture(scope="session")

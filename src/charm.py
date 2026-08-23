@@ -97,6 +97,7 @@ class LokiVmCharm(ops.CharmBase):
             data_dir=DEFAULT_DATA_DIR,
             last_good_config="",
             last_failed_config_path="",
+            configuration_error="",
             config_drifted=False,
             peer_addresses_json="",
         )
@@ -421,7 +422,13 @@ class LokiVmCharm(ops.CharmBase):
         """
         prepare_filesystem_rule_store(self.data_dir)
         loki.ensure_data_dir_permissions(self.data_dir)
-        config_text = self._render_config_text()
+        self._stored.configuration_error = ""
+        try:
+            config_text = self._render_config_text()
+        except (InvalidConfigurationError, ValueError) as exc:
+            logger.warning("Cannot render managed Loki configuration: %s", exc)
+            self._stored.configuration_error = str(exc)
+            return False, False
         if not config_text:
             return True, False
         if not self._validate_config_text(config_text):
@@ -450,6 +457,7 @@ class LokiVmCharm(ops.CharmBase):
         if self._stored.config_drifted:
             logger.info("Loki config drift resolved by applying charm configuration.")
         self._stored.config_drifted = False
+        self._stored.configuration_error = ""
         return True, True
 
     def _persist_failed_config(self, config_text: str) -> Path | None:
@@ -472,6 +480,8 @@ class LokiVmCharm(ops.CharmBase):
 
     def _invalid_config_status(self) -> ops.WaitingStatus:
         """Return a WaitingStatus message for invalid Loki config."""
+        if self._stored.configuration_error:
+            return ops.WaitingStatus(f"{self._stored.configuration_error}; check logs")
         if self._stored.last_failed_config_path:
             message = f"Invalid Loki config; check logs and {self._stored.last_failed_config_path}"
         else:
@@ -482,6 +492,7 @@ class LokiVmCharm(ops.CharmBase):
         """Return the Loki config as a YAML string."""
         override = str(self.config.get("config-override", "")).strip()
         if override:
+            self._validate_override_ruler_contract(override)
             return override
         source_data = self._sorted_source_data()
         builder = ConfigBuilder(
@@ -495,9 +506,37 @@ class LokiVmCharm(ops.CharmBase):
             data_dir=self.data_dir,
             memberlist_join_members=self._memberlist_join_members(),
             s3=self._storage_backend_state().s3,
+            loki_version=loki.get_version(),
         )
         rendered = yaml.safe_dump(builder.build(), sort_keys=False)
         return f"{loki.GENERATED_CONFIG_HEADER}{rendered}"
+
+    @staticmethod
+    def _validate_override_ruler_contract(override: str) -> None:
+        """Require override config to retain the local ruler contract used by the charm."""
+        try:
+            document = yaml.safe_load(override)
+        except yaml.YAMLError as exc:
+            raise InvalidConfigurationError("config-override must be valid YAML") from exc
+        if not isinstance(document, dict):
+            raise InvalidConfigurationError("config-override must be a YAML mapping")
+        ruler = document.get("ruler")
+        ruler_storage = document.get("ruler_storage")
+        server = document.get("server")
+        capable = (
+            document.get("auth_enabled") is False
+            and isinstance(server, dict)
+            and server.get("http_listen_port", 3100) == 3100
+            and isinstance(ruler, dict)
+            and ruler.get("enable_api") is True
+            and bool(ruler.get("rule_path"))
+            and isinstance(ruler_storage, dict)
+            and bool(ruler_storage.get("backend"))
+        )
+        if not capable:
+            raise InvalidConfigurationError(
+                "config-override must enable the charm-managed ruler API"
+            )
 
     def _validate_config_text(self, config_text: str) -> bool:
         """Validate Loki config by writing to a temp file and running verify."""

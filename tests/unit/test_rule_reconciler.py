@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from rule_reconciler import (
     CACHE_KEY,
@@ -179,13 +180,20 @@ class FakeRulerClient:
 
 class FakeResponse:
     def __init__(
-        self, status_code: int, text: str = "", *, chunks: list[bytes] | None = None
+        self,
+        status_code: int,
+        text: str = "",
+        *,
+        chunks: list[bytes] | None = None,
+        on_iter: Any | None = None,
     ) -> None:
         self.status_code = status_code
         self.text = text
         self.content = text.encode()
         self.chunks = chunks if chunks is not None else [self.content]
+        self.on_iter = on_iter
         self.closed = False
+        self.iterated = False
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -193,6 +201,9 @@ class FakeResponse:
 
     def iter_content(self, chunk_size: int) -> Any:
         assert chunk_size > 0
+        self.iterated = True
+        if self.on_iter:
+            self.on_iter()
         yield from self.chunks
 
     def close(self) -> None:
@@ -201,12 +212,53 @@ class FakeResponse:
 
 class FakeSession:
     def __init__(self, responses: list[FakeResponse]) -> None:
-        self.responses = responses
+        self.responses = list(responses)
         self.requests: list[tuple[str, str, dict[str, Any]]] = []
 
     def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
         self.requests.append((method, url, kwargs))
         return self.responses.pop(0)
+
+
+class MutableClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class StatefulRulerSession:
+    """Model Loki namespace mutations and one deliberately late write response."""
+
+    def __init__(self, groups: list[dict[str, Any]], *, expire_after: str) -> None:
+        self.groups = groups
+        self.expire_after = expire_after
+        self.clock = MutableClock()
+        self.expired = False
+        self.post_count = 0
+        self.requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+        self.requests.append((method, url, kwargs))
+        if method == "GET":
+            return FakeResponse(200, json.dumps(self.groups))
+        if method == "DELETE":
+            self.groups = []
+            self._expire_once("delete")
+            return FakeResponse(202)
+        assert method == "POST"
+        group = yaml.safe_load(kwargs["data"])
+        self.groups = [item for item in self.groups if item["name"] != group["name"]]
+        self.groups.append(group)
+        self.post_count += 1
+        self._expire_once(f"post-{self.post_count}")
+        return FakeResponse(202)
+
+    def _expire_once(self, point: str) -> None:
+        if point == self.expire_after and not self.expired:
+            self.clock.now = MAX_APPLY_SECONDS + 1
+            self.expired = True
 
 
 def test_parse_preserves_rule_content_and_rejects_boundary_size() -> None:
@@ -653,6 +705,93 @@ def test_api_client_rejects_stream_over_limit_without_buffering_whole_response()
     assert len(session.requests) == 1
 
 
+def test_api_client_rejects_unknown_nonempty_namespace_mapping() -> None:
+    response = FakeResponse(200, '{"unexpected":"shape"}')
+
+    with pytest.raises(InvalidRuleSnapshotError):
+        LokiRulerApiClient(
+            "http://127.0.0.1:3100", session=FakeSession([response])
+        ).replace_namespace([])
+
+    assert response.closed is True
+
+
+def test_api_client_accepts_explicit_empty_namespace_mapping() -> None:
+    response = FakeResponse(200, "{}")
+    session = FakeSession([response])
+
+    previous = LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([])
+
+    assert previous == []
+    assert [request[0] for request in session.requests] == ["GET"]
+
+
+@pytest.mark.parametrize("status", [202, 500])
+def test_api_client_streams_and_closes_write_responses(status: int) -> None:
+    group = _group("new")
+    delete = FakeResponse(status)
+    responses = [FakeResponse(200, "{}"), delete]
+    if status == 202:
+        responses.append(FakeResponse(202))
+    session = FakeSession(responses)
+
+    if status == 202:
+        LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([group])
+    else:
+        with pytest.raises(RuntimeError):
+            LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([group])
+
+    assert all(request[2]["stream"] is True for request in session.requests)
+    assert all(response.closed for response in responses)
+    assert all(response.iterated for response in responses)
+
+
+def test_api_client_bounds_write_response_body() -> None:
+    oversized = FakeResponse(
+        202,
+        chunks=[b"x" * LokiRulerApiClient.MAX_WRITE_RESPONSE_BYTES, b"x"],
+    )
+    rollback_delete = FakeResponse(202)
+    session = FakeSession([FakeResponse(200, "{}"), oversized, rollback_delete])
+
+    with pytest.raises(InvalidRuleSnapshotError):
+        LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace(
+            [_group("new")]
+        )
+
+    assert oversized.closed is True
+    assert rollback_delete.closed is True
+
+
+def test_api_client_deadline_bounds_slow_write_response_and_recovers() -> None:
+    clock = MutableClock()
+
+    def expire() -> None:
+        clock.now = MAX_APPLY_SECONDS + 1
+
+    late_delete = FakeResponse(202, chunks=[b"ok"], on_iter=expire)
+    rollback_delete = FakeResponse(202)
+    rollback_post = FakeResponse(202)
+    old = _group("old")
+    session = FakeSession(
+        [
+            FakeResponse(200, json.dumps([old])),
+            late_delete,
+            rollback_delete,
+            rollback_post,
+        ]
+    )
+
+    with pytest.raises(TimeoutError):
+        LokiRulerApiClient(
+            "http://127.0.0.1:3100", session=session, clock=clock
+        ).replace_namespace([_group("new")])
+
+    assert late_delete.closed is True
+    assert rollback_delete.closed is True
+    assert rollback_post.closed is True
+
+
 def test_api_client_creates_namespace_when_all_rules_endpoint_is_empty() -> None:
     group = _group("new")
     session = FakeSession([FakeResponse(200, "{}"), FakeResponse(202), FakeResponse(202)])
@@ -765,11 +904,62 @@ def test_api_client_deadline_stops_after_late_write_response() -> None:
         last = next(moments, last)
         return last
 
-    session = FakeSession([FakeResponse(200, json.dumps([old])), FakeResponse(202)])
+    session = FakeSession(
+        [
+            FakeResponse(200, json.dumps([old])),
+            FakeResponse(202),
+            FakeResponse(202),
+            FakeResponse(202),
+        ]
+    )
 
     with pytest.raises(TimeoutError):
         LokiRulerApiClient(
             "http://127.0.0.1:3100", session=session, clock=clock
         ).replace_namespace([new])
 
-    assert [request[0] for request in session.requests] == ["GET", "DELETE"]
+    assert [request[0] for request in session.requests] == [
+        "GET",
+        "DELETE",
+        "DELETE",
+        "POST",
+    ]
+
+
+@pytest.mark.parametrize("expire_after", ["delete", "post-1"])
+def test_api_client_deadline_recovery_restores_captured_namespace(expire_after: str) -> None:
+    old = [_group("old-a"), _group("old-b")]
+    session = StatefulRulerSession(old, expire_after=expire_after)
+
+    with pytest.raises(TimeoutError):
+        LokiRulerApiClient(
+            "http://127.0.0.1:3100", session=session, clock=session.clock
+        ).replace_namespace([_group("new-a"), _group("new-b")])
+
+    assert session.groups == old
+
+
+@pytest.mark.parametrize("expire_after", ["delete", "post-1"])
+@pytest.mark.parametrize("cache_valid", [True, False], ids=["valid-cache", "invalid-cache"])
+def test_reconcile_deadline_recovery_restores_live_namespace(
+    expire_after: str, cache_valid: bool
+) -> None:
+    old = [_group("old-a"), _group("old-b")]
+    session = StatefulRulerSession(old, expire_after=expire_after)
+    client = LokiRulerApiClient("http://127.0.0.1:3100", session=session, clock=session.clock)
+    cache_value = (
+        _encoded_cache(_cache_document(relations={"1": old}, accepted=old))
+        if cache_valid
+        else "not-base64"
+    )
+    persisted: list[str] = []
+
+    result = LokiRuleReconciler(client).reconcile(
+        [RelationRuleSource(1, _raw(_group("new-a"), _group("new-b")))],
+        cache_value=cache_value,
+        persist=persisted.append,
+    )
+
+    assert result.committed is False
+    assert session.groups == old
+    assert persisted == []

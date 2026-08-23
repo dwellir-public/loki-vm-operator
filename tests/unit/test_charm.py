@@ -56,7 +56,7 @@ def _context() -> testing.Context:
 
 def mock_get_version():
     """Get a mock version string without executing the workload code."""
-    return "1.0.0"
+    return "3.4.0"
 
 
 def _s3_relation(
@@ -483,13 +483,64 @@ def test_config_override_used(monkeypatch: pytest.MonkeyPatch):
         "retention-period": 0,
         "reporting-enabled": True,
         "external-url": "",
-        "config-override": "auth_enabled: false\nserver:\n  http_listen_port: 3100\n",
+        "config-override": (
+            "auth_enabled: false\n"
+            "server:\n  http_listen_port: 3100\n"
+            "ruler:\n  enable_api: true\n  rule_path: /var/lib/loki/ruler-tmp\n"
+            "ruler_storage:\n  backend: filesystem\n"
+            "  filesystem:\n    dir: /var/lib/loki/rules\n"
+        ),
     }
 
     state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
 
     assert "auth_enabled: false" in seen["config"]
     assert state_out.unit_status == testing.ActiveStatus("ready(1/1), storage(local)")
+
+
+def test_config_override_without_managed_ruler_contract_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An override must not silently disable the ruler API managed by the charm."""
+    ctx = _context()
+    writes: list[str] = []
+    monkeypatch.setattr(
+        "charm.loki.write_config_text", lambda config_text, **_: writes.append(config_text)
+    )
+    config = {
+        "ingestion-rate-mb": 4,
+        "ingestion-burst-size-mb": 15,
+        "retention-period": 0,
+        "reporting-enabled": True,
+        "external-url": "",
+        "config-override": "auth_enabled: false\nserver:\n  http_listen_port: 3100\n",
+    }
+
+    state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))
+
+    assert writes == []
+    assert state_out.unit_status == testing.WaitingStatus(
+        "config-override must enable the charm-managed ruler API; check logs"
+    )
+
+
+def test_generated_config_reports_unsupported_pre_3_4_loki(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Charm upgrades must not write Thanos config to an older installed Loki."""
+    ctx = _context()
+    writes: list[str] = []
+    monkeypatch.setattr("charm.loki.get_version", lambda: "3.3.2")
+    monkeypatch.setattr(
+        "charm.loki.write_config_text", lambda config_text, **_: writes.append(config_text)
+    )
+
+    state_out = ctx.run(ctx.on.upgrade_charm(), testing.State())
+
+    assert writes == []
+    assert state_out.unit_status == testing.WaitingStatus(
+        "Loki >= 3.4.0 is required for managed ruler storage; found 3.3.2; check logs"
+    )
 
 
 def test_invalid_config_keeps_last_good(monkeypatch: pytest.MonkeyPatch):
@@ -551,7 +602,12 @@ def test_config_drift_sets_maintenance(monkeypatch: pytest.MonkeyPatch, tmp_path
         "retention-period": 0,
         "reporting-enabled": True,
         "external-url": "",
-        "config-override": "auth_enabled: false\n",
+        "config-override": (
+            "auth_enabled: false\n"
+            "server:\n  http_listen_port: 3100\n"
+            "ruler:\n  enable_api: true\n  rule_path: /var/lib/loki/ruler-tmp\n"
+            "ruler_storage:\n  backend: filesystem\n"
+        ),
     }
 
     state_out = ctx.run(ctx.on.config_changed(), testing.State(config=config))

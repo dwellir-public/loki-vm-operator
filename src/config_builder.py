@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 HTTP_LISTEN_PORT = 3100
+MINIMUM_THANOS_OBJSTORE_VERSION = (3, 4, 0)
 
 DEFAULT_CONFIG_DIR = "/etc/loki"
 DEFAULT_CONFIG_PATH = os.path.join(DEFAULT_CONFIG_DIR, "config.yml")
@@ -60,6 +61,7 @@ class ConfigBuilder:
         datasource_uid: Optional[str] = None,
         memberlist_join_members: Optional[List[str]] = None,
         s3: Optional[S3StorageConfig] = None,
+        loki_version: Optional[str] = None,
     ):
         """Init method."""
         self.instance_addr = instance_addr
@@ -74,6 +76,7 @@ class ConfigBuilder:
         self.datasource_uid = datasource_uid
         self.memberlist_join_members = memberlist_join_members
         self.s3 = s3
+        self.loki_version = loki_version
 
         self.data_dir = data_dir
         self.chunks_dir = os.path.join(self.data_dir, "chunks")
@@ -85,6 +88,13 @@ class ConfigBuilder:
 
     def build(self) -> dict:
         """Build Loki config dictionary."""
+        if (
+            self.loki_version
+            and self._version_tuple(self.loki_version) < MINIMUM_THANOS_OBJSTORE_VERSION
+        ):
+            raise ValueError(
+                f"Loki >= 3.4.0 is required for managed ruler storage; found {self.loki_version}"
+            )
         loki_config = {
             "target": self._target,
             "auth_enabled": self._auth_enabled,
@@ -113,6 +123,12 @@ class ConfigBuilder:
             loki_config["analytics"] = self._analytics
 
         return loki_config
+
+    @staticmethod
+    def _version_tuple(version: str) -> tuple[int, int, int]:
+        """Normalize the numeric workload version reported by Loki."""
+        values = [int(value) for value in version.split(".")[:3]]
+        return tuple((values + [0, 0, 0])[:3])  # type: ignore[return-value]
 
     @property
     def _common(self) -> dict:

@@ -119,6 +119,9 @@ config:
     config-override:
       description: |
         Full Loki configuration file as a string. When set, this overrides the
-        generated configuration entirely. Set to empty to revert to generated config.
+        generated configuration entirely. It must keep auth disabled, listen on
+        port 3100, enable the ruler API with a rule path, and configure a
+        ruler_storage backend so relation alert rules remain charm-managed. Set
+        to empty to revert to generated config.
       type: string
       default: ""

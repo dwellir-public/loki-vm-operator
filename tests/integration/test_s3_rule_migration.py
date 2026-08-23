@@ -190,6 +190,15 @@ def test_wait_for_leader_accepts_jubilant_titlecase_boolean(
     _wait_for_leader(FakeJuju(), unit="loki-vm/1", timeout=0.01)
 
 
+def test_workload_version_parses_loki_cli_output() -> None:
+    class FakeJuju:
+        def ssh(self, *args: str) -> str:
+            assert args == ("loki-vm/0", "loki", "--version")
+            return "loki, version 3.4.6 (branch: HEAD, revision: abc)"
+
+    assert _workload_version(FakeJuju(), unit="loki-vm/0") == "3.4.6"
+
+
 def _garage_addresses(juju: Any) -> tuple[str, str]:
     """Return Garage's model-private IPv4 and global model IPv6 addresses."""
     addresses = [
@@ -200,6 +209,15 @@ def _garage_addresses(juju: Any) -> tuple[str, str]:
         address for address in addresses if address.version == 6 and not address.is_link_local
     )
     return str(ipv4), str(ipv6)
+
+
+def _workload_version(juju: Any, *, unit: str) -> str:
+    """Read the installed Loki version without relying on charm status."""
+    output = juju.ssh(unit, "loki", "--version")
+    match = re.search(r"\bversion\s+([0-9]+(?:\.[0-9]+){1,3})\b", output)
+    if match is None:
+        raise AssertionError(f"Could not parse Loki version on {unit}")
+    return match.group(1)
 
 
 def _wait_for_baseline_ready(
@@ -419,6 +437,7 @@ def test_s3_upgrade_preserves_logs_rules_and_leader_recovery(
     juju: Any,
     charm: Path,
     baseline_charm: Path,
+    baseline_loki_version: str,
     garage_charm: Path,
     rule_provider_charm: Path,
 ) -> None:
@@ -431,6 +450,8 @@ def test_s3_upgrade_preserves_logs_rules_and_leader_recovery(
     juju.deploy(baseline_charm.resolve(), app="loki-vm")
     juju.integrate("garage-vm:s3", "loki-vm:s3")
     _wait_for_baseline_ready(juju, units=("loki-vm/0",))
+    observed_baseline_version = _workload_version(juju, unit="loki-vm/0")
+    assert observed_baseline_version == baseline_loki_version
 
     pre_marker = f"task7a-pre-upgrade-{time.time_ns()}"
     pre_timestamp = _push_log(juju, unit="loki-vm/0", marker=pre_marker)
@@ -448,6 +469,7 @@ def test_s3_upgrade_preserves_logs_rules_and_leader_recovery(
 
     juju.refresh("loki-vm", path=charm.resolve())
     juju.wait(jubilant.all_active, timeout=20 * 60)
+    assert _workload_version(juju, unit="loki-vm/1") == observed_baseline_version
     _wait_for_log(juju, unit="loki-vm/1", marker=pre_marker, timestamp=pre_timestamp)
 
     fresh_marker = f"task7a-post-upgrade-{time.time_ns()}"

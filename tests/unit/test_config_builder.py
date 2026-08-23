@@ -1,7 +1,40 @@
 # Copyright 2026 Erik Lönroth
 # See LICENSE file for licensing details.
 
+import pytest
+
 from config_builder import DEFAULT_DATA_DIR, ConfigBuilder, S3StorageConfig
+
+
+@pytest.mark.parametrize("version", ["2.9.10", "3.3.2"])
+def test_generated_managed_ruler_config_rejects_pre_3_4_loki(version: str) -> None:
+    builder = ConfigBuilder(
+        instance_addr="127.0.0.1",
+        ingestion_rate_mb=4,
+        ingestion_burst_size_mb=15,
+        retention_period=0,
+        reporting_enabled=True,
+        loki_version=version,
+    )
+
+    with pytest.raises(ValueError, match="Loki >= 3.4.0"):
+        builder.build()
+
+
+@pytest.mark.parametrize("version", ["3.4.0", "3.5.3", None])
+def test_generated_managed_ruler_config_accepts_supported_or_unknown_loki(
+    version: str | None,
+) -> None:
+    builder = ConfigBuilder(
+        instance_addr="127.0.0.1",
+        ingestion_rate_mb=4,
+        ingestion_burst_size_mb=15,
+        retention_period=0,
+        reporting_enabled=True,
+        loki_version=version,
+    )
+
+    assert builder.build()["storage_config"]["use_thanos_objstore"] is True
 
 
 def test_config_builder_basic_fields():
