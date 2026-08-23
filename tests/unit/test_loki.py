@@ -139,6 +139,44 @@ def test_check_endpoint_returns_error_for_http_error(monkeypatch: pytest.MonkeyP
     assert error == "HTTP 503: Service Unavailable"
 
 
+def test_check_s3_endpoint_accepts_only_expected_anonymous_auth_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def _raise(*args, **kwargs):
+        raise loki.error.HTTPError(
+            url="http://example:9000",
+            code=403,
+            msg="Forbidden",
+            hdrs=Message(),
+            fp=None,
+        )
+
+    monkeypatch.setattr(loki.request, "urlopen", _raise)
+
+    reachable, error = loki.check_s3_endpoint("http://example:9000")
+
+    assert reachable is True
+    assert error is None
+
+
+def test_check_s3_endpoint_rejects_other_http_errors(monkeypatch: pytest.MonkeyPatch):
+    def _raise(*args, **kwargs):
+        raise loki.error.HTTPError(
+            url="http://example:9000",
+            code=404,
+            msg="Not Found",
+            hdrs=Message(),
+            fp=None,
+        )
+
+    monkeypatch.setattr(loki.request, "urlopen", _raise)
+
+    reachable, error = loki.check_s3_endpoint("http://example:9000")
+
+    assert reachable is False
+    assert error == "HTTP 404: Not Found"
+
+
 def test_ensure_data_dir_symlink_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     default_dir = tmp_path / "default"
     target_dir = tmp_path / "target"

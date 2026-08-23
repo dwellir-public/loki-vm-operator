@@ -1,0 +1,30 @@
+type: charm
+name: loki-rule-provider-test
+title: Loki rule provider integration fixture
+summary: Publishes test-only Loki alert rules
+description: Publishes configured standard alert_rules relation data for integration tests.
+base: ubuntu@24.04
+platforms:
+  amd64:
+
+parts:
+  charm:
+    plugin: uv
+    source: .
+    build-snaps:
+      - astral-uv
+
+requires:
+  send-loki-logs:
+    interface: loki_push_api
+
+config:
+  options:
+    alert-rules:
+      type: string
+      default: '{"groups":[]}'
+      description: Complete standard Loki alert_rules JSON snapshot.
+    omit-alert-rules:
+      type: boolean
+      default: false
+      description: Remove alert_rules from the app databag to test withdrawal.

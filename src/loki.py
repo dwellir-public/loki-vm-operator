@@ -336,6 +336,7 @@ def check_endpoint(
     *,
     timeout: int = DEFAULT_STATUS_TIMEOUT,
     expected_body: str | None = None,
+    accepted_http_errors: frozenset[int] = frozenset(),
 ) -> tuple[bool, str | None]:
     """Probe an HTTP endpoint and return `(ready, error)`."""
     try:
@@ -347,10 +348,23 @@ def check_endpoint(
                 return True, None
             return False, f"HTTP {response.status}: {body or 'unexpected response'}"
     except error.HTTPError as exc:
+        if exc.code in accepted_http_errors:
+            return True, None
         body = exc.read().decode("utf-8", errors="replace").strip()
         return False, f"HTTP {exc.code}: {body or exc.reason}"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+
+def check_s3_endpoint(
+    url: str, *, timeout: int = DEFAULT_STATUS_TIMEOUT
+) -> tuple[bool, str | None]:
+    """Probe S3 reachability, accepting its anonymous HTTP 403 authentication challenge.
+
+    This does not validate relation credentials. Loki's own readiness check provides
+    that stronger signal because Loki opens the configured bucket during startup.
+    """
+    return check_endpoint(url, timeout=timeout, accepted_http_errors=frozenset({403}))
 
 
 def prepare_shutdown(base_url: str, *, timeout: int = DEFAULT_STATUS_TIMEOUT) -> None:

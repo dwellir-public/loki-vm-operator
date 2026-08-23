@@ -64,6 +64,59 @@ Supported relations:
 - `s3` (requires) for upstream S3 provider contracts
 - `loki_push_api` (provides Loki push endpoint)
 
+### Alert rules on `loki_push_api`
+
+The same standard `loki_push_api` relation accepts application-owned
+`alert_rules` JSON from Alloy or another compatible producer. The leader
+validates each remote application independently and merges groups in stable
+relation-ID/group-name order without changing expressions, names, or labels.
+The merged groups are written to Loki's ruler API in the charm-owned
+`juju-loki-vm` namespace; they are separate from the log ingestion path and do
+not require Alertmanager to be configured.
+For a single local unit, the ruler store is filesystem-backed on the attached
+`loki-persisted` volume. With Loki authentication disabled, the charm prepares
+the implicit `fake` tenant directory before the first API write. Clustered Loki
+already requires S3; the ruler uses that same shared backend under its own
+`ruler` prefix so leadership changes do not leave unit-local rule copies.
+Both chunks and rules use Loki's Thanos object-store client with the existing
+chunk directory or S3 bucket unchanged; path-style S3 lookup remains enabled
+for Garage and other compatible providers.
+
+Each relation document must be strictly below 60 KiB. The charm also bounds
+JSON depth, node count, group-name bytes, cache size, the number of admitted
+source relations, and aggregate group/rule and ruler-API work. One apply has a
+fixed total deadline. A malformed or over-limit update retains that relation's
+last-known-good snapshot while valid sibling relations continue. Valid omission
+or relation removal withdraws owned groups.
+
+The `replicas` application databag stores a bounded compressed cache containing
+per-relation snapshots and the last accepted rendered state. This supports
+replay after leadership changes, charm upgrades, service restarts, and periodic
+reconciliation. Candidate persistence or ruler API failure retains and
+replays the prior accepted state. Rule bodies are never written to charm logs.
+
+Loki runs with `auth_enabled: false`, and its ingestion, query, and ruler APIs
+share the listener on `0.0.0.0:3100`. The charm therefore assumes a trusted
+Juju model network: the ruler API is not authenticated independently. Do not
+expose Loki's management routes directly to untrusted networks. When publishing
+ingestion or query endpoints externally, use ingress/firewall segmentation that
+does not publish `/loki/api/v1/rules` and restrict direct port 3100 access to
+trusted charm and operator traffic.
+
+After a single-unit start or configuration-driven restart, the charm waits for
+the local `/ready` endpoint before publishing final runtime health. The wait is
+bounded: if Loki is still starting, the hook completes successfully with
+`waiting for Loki readiness` Maintenance status, and later lifecycle events
+retry health and rule convergence. Clustered deployments continue to use the
+separate rolling-restart coordination and readiness checks.
+
+Inspect loaded alert rules directly:
+
+```bash
+juju exec --unit loki-vm/0 -- \
+  curl -fsS 'http://127.0.0.1:3100/prometheus/api/v1/rules?type=alert'
+```
+
 ## 3-node cluster behavior
 
 When deployed with three units, `loki-vm` forms a memberlist cluster. Each unit
@@ -96,6 +149,7 @@ Local disk is still used for:
 - TSDB cache
 - compactor working files
 - local rules state
+- ruler API scratch state under the effective Loki data directory
 
 Garage object storage is used for:
 
