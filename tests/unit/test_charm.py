@@ -378,10 +378,10 @@ def test_broken_rule_relation_withdraws_its_groups(monkeypatch: pytest.MonkeyPat
     assert _FakeRulerApi.calls[-1] == []
 
 
-def test_relation_changed_with_omitted_rules_withdraws_snapshot(
+def test_relation_changed_with_omitted_rules_retains_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Removing alert_rules from an extant app databag must reconcile withdrawal."""
+    """Missing data during publication must retain the accepted source snapshot."""
     ctx = _context()
     source = _rule_relation()
     peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
@@ -405,7 +405,8 @@ def test_relation_changed_with_omitted_rules_withdraws_snapshot(
         testing.State(leader=True, relations=[source_without_rules, peer_out]),
     )
 
-    assert _FakeRulerApi.calls[-1] == []
+    assert _FakeRulerApi.calls[-1] == _FakeRulerApi.calls[0]
+    assert _FakeRulerApi.calls[-1]
 
 
 def test_rule_relation_changed_republishes_configured_push_endpoint(

@@ -11,16 +11,20 @@ import copy
 import json
 import logging
 import math
+import re
 import time
 import zlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
 import requests
 import yaml
+from charms.dwellir_observability.v0 import alert_rule_transport as transport
 
 logger = logging.getLogger(__name__)
 
@@ -38,21 +42,21 @@ def prepare_filesystem_rule_store(data_dir: str | Path) -> None:
 
 
 MAX_RELATION_VALUE_BYTES = 60 * 1024
-MAX_SOURCE_RELATIONS = 32
+MAX_SOURCE_RELATIONS = 1024
 MAX_DOCUMENT_DEPTH = 32
-MAX_DOCUMENT_NODES = 10_000
+MAX_DOCUMENT_NODES = 500_000
 MAX_GROUP_NAME_BYTES = 512
-MAX_TOTAL_GROUPS = 512
+MAX_TOTAL_GROUPS = 8192
 MAX_TOTAL_RULES = 10_000
 MAX_CACHE_VALUE_BYTES = 60 * 1024
-MAX_CACHE_DECODED_BYTES = 2 * 1024 * 1024
-MAX_CACHE_NODES = MAX_SOURCE_RELATIONS * MAX_DOCUMENT_NODES + 128
-CACHE_VERSION = 1
+MAX_CACHE_DECODED_BYTES = 16 * 1024 * 1024
+MAX_CACHE_NODES = 2_000_000 + 128
+CACHE_VERSION = 2
 CACHE_KEY = "_loki_rule_reconciler_state_v1"
 MAX_APPLY_SECONDS = 30
-MAX_MUTATION_API_OPERATIONS = 1 + MAX_TOTAL_GROUPS
+MAX_MUTATION_API_OPERATIONS = 1024
 # One read plus a full candidate mutation and worst-case full recovery.
-MAX_API_OPERATIONS = 1 + 2 * MAX_MUTATION_API_OPERATIONS
+MAX_API_OPERATIONS = 2 + 2 * MAX_MUTATION_API_OPERATIONS
 MAX_RECONCILE_API_OPERATIONS = 2 * MAX_API_OPERATIONS
 MAX_RECONCILE_SECONDS = 4 * MAX_APPLY_SECONDS
 
@@ -63,6 +67,40 @@ class InvalidRuleSnapshotError(ValueError):
 
 class InvalidRuleCacheError(ValueError):
     """Report malformed or oversized leader-shared rule state."""
+
+
+def _duration_value(value: Any) -> Any:
+    """Compare equivalent Prometheus duration spellings without changing payloads."""
+    if not isinstance(value, str):
+        return value
+    tokens = re.findall(r"([0-9]+(?:\.[0-9]+)?)(ms|s|m|h|d|w|y)", value)
+    if not tokens or "".join(number + unit for number, unit in tokens) != value:
+        return value
+    factors = {
+        "ms": 1,
+        "s": 1000,
+        "m": 60000,
+        "h": 3600000,
+        "d": 86400000,
+        "w": 604800000,
+        "y": 31536000000,
+    }
+    return str(
+        sum((Decimal(number) * factors[unit] for number, unit in tokens), Decimal(0)).normalize()
+    )
+
+
+def _normalize_durations(value: dict[str, Any], fields: tuple[str, ...]) -> None:
+    """Normalize defaults only in a copied comparison document."""
+    for field in fields:
+        if field in value:
+            value[field] = _duration_value(value[field])
+        if value.get(field) in (None, "0"):
+            value.pop(field, None)
+
+
+class RulerApplyPendingError(RuntimeError):
+    """A bounded apply batch completed; resume from observed state next hook."""
 
 
 class RulerApplyError(RuntimeError):
@@ -95,6 +133,9 @@ class RuleReconcileResult:
 
     accepted_groups: list[dict[str, Any]]
     committed: bool
+    received_sources: int = 0
+    accepted_sources: int = 0
+    rejected_sources: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,7 +263,7 @@ def parse_rule_groups(raw_payload: str | None) -> list[dict[str, Any]]:
         raise InvalidRuleSnapshotError("alert_rules exceeds the safe size limit")
     try:
         document = json.loads(
-            raw_payload,
+            transport.decode(raw_payload, wire_limit=MAX_RELATION_VALUE_BYTES),
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
         )
@@ -235,6 +276,8 @@ def parse_rule_groups(raw_payload: str | None) -> list[dict[str, Any]]:
         ValueError,
     ) as exc:
         raise InvalidRuleSnapshotError("alert_rules is not valid bounded JSON") from exc
+    if document == {}:
+        return []
     if not isinstance(document, dict) or set(document) != {"groups"}:
         raise InvalidRuleSnapshotError("alert_rules must contain only groups")
     groups = document["groups"]
@@ -260,9 +303,11 @@ def merge_rule_groups(
     return merged
 
 
-def _validate_aggregate_limits(groups: Sequence[Mapping[str, Any]]) -> None:
+def _validate_aggregate_limits(
+    groups: Sequence[Mapping[str, Any]], *, generations: int = 1
+) -> None:
     """Bound total merge and ruler API work across all admitted sources."""
-    if len(groups) > MAX_TOTAL_GROUPS:
+    if len(groups) > generations * MAX_TOTAL_GROUPS:
         raise InvalidRuleSnapshotError("rule aggregate has too many groups")
     rule_count = 0
     for group in groups:
@@ -270,7 +315,7 @@ def _validate_aggregate_limits(groups: Sequence[Mapping[str, Any]]) -> None:
         if not isinstance(rules, list):
             raise InvalidRuleSnapshotError("rule group rules must be a list")
         rule_count += len(rules)
-        if rule_count > MAX_TOTAL_RULES:
+        if rule_count > generations * MAX_TOTAL_RULES:
             raise InvalidRuleSnapshotError("rule aggregate has too many rules")
 
 
@@ -281,6 +326,8 @@ def _decompress_cache(encoded: str) -> bytes:
     try:
         if len(encoded.encode("utf-8")) >= MAX_CACHE_VALUE_BYTES:
             raise InvalidRuleCacheError("rule cache exceeds the safe size limit")
+        if encoded.startswith("xz:"):
+            return transport.decompress(encoded[3:], maximum=MAX_CACHE_DECODED_BYTES)
         compressed = base64.b64decode(encoded, validate=True)
         decompressor = zlib.decompressobj()
         raw = decompressor.decompress(compressed, MAX_CACHE_DECODED_BYTES + 1)
@@ -323,7 +370,9 @@ def _validate_cached_snapshot(groups: Any) -> list[dict[str, Any]]:
             ensure_ascii=False,
             allow_nan=False,
         )
-        return parse_rule_groups(serialized)
+        return parse_rule_groups(
+            transport.encode(serialized, {transport.ENCODINGS_KEY: transport.ENCODINGS})
+        )
     except (InvalidRuleSnapshotError, TypeError, UnicodeError, ValueError) as exc:
         raise InvalidRuleCacheError("rule cache relation snapshot is invalid") from exc
 
@@ -350,7 +399,9 @@ def _decode_cache(encoded: str | None) -> _RuleCache:
         raise InvalidRuleCacheError("rule cache is not valid bounded state") from exc
     if not isinstance(document, dict) or set(document) != {"accepted", "relations", "version"}:
         raise InvalidRuleCacheError("rule cache structure is invalid")
-    if document["version"] != CACHE_VERSION or not isinstance(document["relations"], dict):
+    if document["version"] not in (1, CACHE_VERSION) or not isinstance(
+        document["relations"], dict
+    ):
         raise InvalidRuleCacheError("rule cache version or relation map is invalid")
     if len(document["relations"]) > MAX_SOURCE_RELATIONS:
         raise InvalidRuleCacheError("rule cache has too many relations")
@@ -364,14 +415,17 @@ def _decode_cache(encoded: str | None) -> _RuleCache:
         ):
             raise InvalidRuleCacheError("rule cache relation identifier is invalid")
         snapshots[int(relation_id_text)] = _validate_cached_snapshot(groups)
+    if document["version"] == 2 and document["accepted"] is None:
+        document["accepted"] = merge_rule_groups(snapshots)
     accepted_groups = _validate_cache_accepted(document["accepted"], snapshots)
     return _RuleCache(snapshots=snapshots, accepted_groups=accepted_groups)
 
 
 def _encode_cache(cache: _RuleCache) -> str:
     """Encode cache state within Juju value and decoded-state limits."""
+    _validate_cache_accepted(cache.accepted_groups, cache.snapshots)
     document = {
-        "accepted": cache.accepted_groups,
+        "accepted": None,
         "relations": {str(key): value for key, value in sorted(cache.snapshots.items())},
         "version": CACHE_VERSION,
     }
@@ -388,7 +442,7 @@ def _encode_cache(cache: _RuleCache) -> str:
         raise InvalidRuleCacheError("rule cache candidate is invalid") from exc
     if len(raw) > MAX_CACHE_DECODED_BYTES:
         raise InvalidRuleCacheError("rule cache decoded content exceeds safe bounds")
-    encoded = base64.b64encode(zlib.compress(raw, level=9)).decode("ascii")
+    encoded = "xz:" + transport.compress(raw)
     if len(encoded.encode("utf-8")) >= MAX_CACHE_VALUE_BYTES:
         raise InvalidRuleCacheError("rule cache value exceeds the safe size limit")
     return encoded
@@ -417,36 +471,30 @@ class LokiRuleReconciler:
             previous = _RuleCache(snapshots={}, accepted_groups=[])
             cache_valid = False
         ordered = sorted(sources, key=lambda source: source.relation_id)
-        if len(ordered) > MAX_SOURCE_RELATIONS:
-            logger.warning(
-                "Only the first %s Loki rule source relations are admitted; %s were present",
-                MAX_SOURCE_RELATIONS,
-                len(ordered),
-            )
-        admitted = ordered[:MAX_SOURCE_RELATIONS]
-        admitted_ids = {source.relation_id for source in admitted}
-        snapshots = {
-            relation_id: groups
-            for relation_id, groups in previous.snapshots.items()
-            if relation_id in admitted_ids
-        }
-        invalid_source = False
-        for source in admitted:
-            try:
-                snapshots[source.relation_id] = parse_rule_groups(source.raw_payload)
-            except InvalidRuleSnapshotError as exc:
-                invalid_source = True
+        snapshots, errors = transport.admit(
+            [(source.relation_id, source.raw_payload) for source in ordered],
+            previous.snapshots,
+            parse_rule_groups,
+            maximum=MAX_SOURCE_RELATIONS,
+        )
+        result = partial(
+            RuleReconcileResult,
+            received_sources=len(ordered),
+            accepted_sources=len(snapshots),
+            rejected_sources=tuple(errors),
+        )
+        invalid_source = bool(errors)
+        if errors:
+            for offset in range(0, len(errors), 16):
                 logger.warning(
-                    "Retaining valid Loki rules for relation %s when available: %s",
-                    source.relation_id,
-                    exc,
+                    "Rule sources rejected or over capacity: %s", errors[offset : offset + 16]
                 )
         if not cache_valid and invalid_source:
             logger.warning(
                 "Cannot reconstruct complete Loki rule state from current relations; "
                 "leaving the ruler namespace unchanged"
             )
-            return RuleReconcileResult([], False)
+            return result([], False)
         try:
             accepted_candidate = merge_rule_groups(snapshots)
             candidate = _RuleCache(snapshots=snapshots, accepted_groups=accepted_candidate)
@@ -454,14 +502,14 @@ class LokiRuleReconciler:
         except (InvalidRuleCacheError, InvalidRuleSnapshotError) as exc:
             logger.warning("Retaining the last accepted Loki rule state: %s", exc)
             self._replay_cached(cache_valid, previous.accepted_groups)
-            return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
+            return result(copy.deepcopy(previous.accepted_groups), False)
         live_before = self._apply_candidate(
             accepted_candidate,
             cache_valid=cache_valid,
             previous_groups=previous.accepted_groups,
         )
         if live_before is None:
-            return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
+            return result(copy.deepcopy(previous.accepted_groups), False)
         try:
             persist(encoded_candidate)
         except Exception as exc:  # noqa: BLE001
@@ -469,8 +517,8 @@ class LokiRuleReconciler:
                 "Failed to persist Loki rule candidate; restoring accepted state: %s", exc
             )
             self._replay(previous.accepted_groups if cache_valid else live_before)
-            return RuleReconcileResult(copy.deepcopy(previous.accepted_groups), False)
-        return RuleReconcileResult(copy.deepcopy(accepted_candidate), True)
+            return result(copy.deepcopy(previous.accepted_groups), False)
+        return result(copy.deepcopy(accepted_candidate), not invalid_source)
 
     def _apply_candidate(
         self,
@@ -482,6 +530,9 @@ class LokiRuleReconciler:
         """Apply once and avoid redundant replay when the API already recovered."""
         try:
             return self._client.replace_namespace(groups)
+        except RulerApplyPendingError:
+            logger.info("Rule reconciliation pending next hook")
+            return None
         except RulerApplyError as exc:
             logger.warning("Failed to apply Loki rule candidate: %s", exc)
             if not exc.restored:
@@ -534,7 +585,7 @@ class LokiRulerApiClient:
     """Idempotently replace one charm-owned namespace through Loki's ruler API."""
 
     NAMESPACE = "juju-loki-vm"
-    MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+    MAX_RESPONSE_BYTES = 16 * 1024 * 1024
     MAX_WRITE_RESPONSE_BYTES = 64 * 1024
 
     def __init__(
@@ -552,7 +603,7 @@ class LokiRulerApiClient:
         self._clock = clock
 
     def replace_namespace(self, groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace transactionally and return validated state for caller rollback."""
+        """Converge a bounded batch and return the previously observed groups."""
         budget = _ApplyBudget(
             deadline=self._clock() + MAX_APPLY_SECONDS,
             clock=self._clock,
@@ -567,16 +618,19 @@ class LokiRulerApiClient:
         if self._canonical(current) == self._canonical(desired):
             return copy.deepcopy(current)
         try:
-            self._write_namespace(desired, budget)
+            self._write_namespace(desired, budget, current=current)
+        except RulerApplyPendingError:
+            raise
         except Exception as apply_error:
             restored = False
             try:
                 recovery_budget = _ApplyBudget(
                     deadline=self._clock() + MAX_APPLY_SECONDS,
                     clock=self._clock,
-                    operations_remaining=MAX_MUTATION_API_OPERATIONS,
+                    operations_remaining=1 + MAX_MUTATION_API_OPERATIONS,
                 )
-                self._write_namespace(current, recovery_budget)
+                observed = self._read_namespace(recovery_budget)
+                self._write_namespace(current, recovery_budget, current=observed)
                 restored = True
             except Exception as rollback_error:  # noqa: BLE001
                 logger.warning("Failed to roll back the Loki ruler namespace: %s", rollback_error)
@@ -620,7 +674,7 @@ class LokiRulerApiClient:
         groups = self._response_groups(document)
         _validate_tree(groups, max_nodes=MAX_CACHE_NODES)
         validated = [_validate_group(group) for group in groups]
-        _validate_aggregate_limits(validated)
+        _validate_aggregate_limits(validated, generations=2)
         budget.check_deadline()
         return validated
 
@@ -645,34 +699,59 @@ class LokiRulerApiClient:
             raise InvalidRuleSnapshotError("Loki ruler namespace response is unrecognized")
         raise InvalidRuleSnapshotError("Loki ruler response structure is invalid")
 
-    def _write_namespace(self, groups: list[dict[str, Any]], budget: _ApplyBudget) -> None:
-        """Delete the namespace then create every desired group in order."""
-        delete_response = self._session.request(
-            "DELETE",
-            self._namespace_url,
-            timeout=budget.request_timeout(self._timeout),
-            stream=True,
-        )
-        self._finish_write_response(
-            delete_response,
-            accepted_statuses={200, 202, 204, 404},
-            budget=budget,
-        )
-        for group in groups:
-            body = yaml.safe_dump(group, sort_keys=False)
+    def _write_namespace(
+        self,
+        groups: list[dict[str, Any]],
+        budget: _ApplyBudget,
+        *,
+        current: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Apply at most 1024 changed groups without deleting the namespace.
+
+        The live ruler stores progress between hooks and leadership changes.
+        Removals follow all successful upserts. This is deliberately not an
+        atomic backend transaction; pending work remains operator-visible.
+        """
+        before = {group["name"]: group for group in (current or [])}
+        desired = {group["name"]: group for group in groups}
+        updates = [
+            group
+            for group in groups
+            if self._canonical([before.get(group["name"], {})]) != self._canonical([group])
+        ]
+        removed = sorted(set(before) - set(desired))
+        work: list[tuple[str, str, dict[str, Any] | None]] = [
+            ("POST", g["name"], g) for g in updates
+        ]
+        work.extend(("DELETE", name, None) for name in removed)
+        for method, name, group in work[:MAX_MUTATION_API_OPERATIONS]:
+            # Stop between successful mutations before the request deadline.
+            # A normal time-sliced batch must not undo its completed work.
+            if budget.deadline is not None and budget.deadline - budget.clock() <= 1:
+                raise RulerApplyPendingError("rule apply time slice exhausted")
+            headers = {}
+            url = self._namespace_url
+            body = None
+            if method == "POST":
+                body = yaml.safe_dump(group, sort_keys=False)
+                headers["Content-Type"] = "application/yaml"
+            else:
+                url += "/" + quote(name, safe="")
             response = self._session.request(
-                "POST",
-                self._namespace_url,
+                method,
+                url,
                 data=body,
-                headers={"Content-Type": "application/yaml"},
+                headers=headers,
                 timeout=budget.request_timeout(self._timeout),
                 stream=True,
             )
             self._finish_write_response(
                 response,
-                accepted_statuses={200, 202, 204},
+                accepted_statuses={200, 202, 204, 404} if method == "DELETE" else {200, 202, 204},
                 budget=budget,
             )
+        if len(work) > MAX_MUTATION_API_OPERATIONS:
+            raise RulerApplyPendingError("more rule groups remain to apply")
 
     def _finish_write_response(
         self,
@@ -701,4 +780,12 @@ class LokiRulerApiClient:
     @staticmethod
     def _canonical(groups: list[dict[str, Any]]) -> str:
         """Return a semantic comparison form without changing API payloads."""
-        return json.dumps(groups, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        normalized = copy.deepcopy(groups)
+        for group in normalized:
+            _normalize_durations(group, ("interval", "query_offset"))
+            for rule in group.get("rules", []):
+                _normalize_durations(rule, ("for", "keep_firing_for"))
+                for field in ("labels", "annotations"):
+                    if not rule.get(field):
+                        rule.pop(field, None)
+        return json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False)

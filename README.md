@@ -503,3 +503,51 @@ relation endpoint.
 - [Contributing](CONTRIBUTING.md) <!-- or link to other contribution documentation -->
 
 - See the [Juju documentation](https://documentation.ubuntu.com/juju/3.6/howto/manage-charms/) for more information about developing and improving charms.
+
+
+## Alert rule delivery capacity
+
+Rule admission counts rule-bearing source relations, with a limit of 1,024. Empty
+telemetry relations do not consume slots. Existing sources retain their slots
+when a new source would exceed capacity. Malformed or temporarily missing updates
+retain their last valid rules; an explicit empty group list or relation removal
+withdraws them. Rejected relation IDs and delivery counts appear in unit logs;
+incomplete delivery is reported in workload status.
+
+Receivers advertise `alert_rules_encodings` and accept legacy JSON plus Canonical's
+LZMA/base64 format in `alert_rules`. Senders compress only for advertising peers.
+There is no machine-observability schema change. The shared bounded adapter is
+owned by `dwellir-observability-reference`; publish that library before releasing
+consumer builds. Its candidate source is vendored byte-for-byte for coordinated
+review and local testing.
+
+The supported test corpus contains 1,024 sources and 4,096 groups/rules, including
+all five Juju topology labels, expressions, and runbook annotations. It is about
+3.4 MB as JSON and 54 KB after LZMA/base64. Every encoded relation value must remain
+below 60 KiB; decoded rule documents are limited to 8 MiB and LZMA decoder memory to
+64 MiB. These are finite limits, not a promise that arbitrary rule volumes will
+fit. Low-compressibility or oversized updates are rejected without truncation.
+Backend admission also limits total groups to 8,192 and total rules to 10,000.
+
+Upgrade receivers before gateways and collectors. A JSON-only destination that
+cannot fit an aggregate retains the previous accepted publication and reports
+pending delivery. New readers accept previous cache formats; older 32-source
+builds cannot read all new cache states or accept the larger volume. Roll back
+using a compatible build; do not delete rules or downgrade blindly to make them
+fit. Notifications require separately configured Alertmanager routing.
+
+The capacity corpus tests are distinct from live relation-scale tests. The
+coordinated reference repository's `tests/retained` suite targets dedicated local
+applications and deliberately leaves applications, relations, and data in place.
+
+
+The ruler client compares observed groups with desired groups and applies at most
+1,024 changed groups per hook. It upserts changes before deleting confirmed removed
+groups, and never clears the entire namespace for an update. Partial convergence
+is visible in status; later hooks resume from the ruler's observed state, including
+after a leader change. Each apply/recovery phase has a 30-second deadline and a
+bounded request count. Other ruler namespaces are untouched.
+
+Ruler reads allow two bounded generations (16,384 groups, 20,000 rules and a
+16 MiB response) so an interrupted additions-before-removals update can resume.
+Desired admission limits remain 8,192 groups and 10,000 rules.

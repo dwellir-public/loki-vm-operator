@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 import ops
 import yaml
+from charms.dwellir_observability.v0 import alert_rule_transport as transport
 from charms.grafana_k8s.v0.grafana_source import GrafanaSourceData, GrafanaSourceProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
 from charms.traefik_k8s.v1.ingress_per_unit import IngressPerUnitRequirer
@@ -380,6 +381,8 @@ class LokiVmCharm(ops.CharmBase):
         if peer is None:
             logger.warning("Cannot reconcile Loki rules until the replicas relation is available")
             return True
+        for relation in self.model.relations.get("loki_push_api", []):
+            relation.data[self.app][transport.ENCODINGS_KEY] = transport.ENCODINGS
         sources = [
             RelationRuleSource(
                 relation.id,
@@ -403,11 +406,27 @@ class LokiVmCharm(ops.CharmBase):
             return True
         client = LokiRulerApiClient("http://127.0.0.1:3100")
         reconciler = LokiRuleReconciler(client)
-        reconciler.reconcile(
+        result = reconciler.reconcile(
             sources,
             cache_value=cache_value,
             persist=lambda value: peer.data[self.app].__setitem__(RULE_CACHE_KEY, value),
         )
+        logger.info(
+            "Rule delivery: received=%d accepted=%d rejected=%d groups=%d pending=%s",
+            result.received_sources,
+            result.accepted_sources,
+            len(result.rejected_sources),
+            len(result.accepted_groups),
+            not result.committed,
+        )
+        if not result.committed and isinstance(
+            self.unit.status, (ops.ActiveStatus, ops.WaitingStatus)
+        ):
+            self.unit.status = ops.WaitingStatus(
+                "Alert rules incomplete: "
+                f"{result.accepted_sources}/{result.received_sources} sources accepted; "
+                f"{len(result.rejected_sources)} rejected; inspect unit logs"
+            )
         return True
 
     def _fast_reconcile_rolling_restart(self) -> None:
