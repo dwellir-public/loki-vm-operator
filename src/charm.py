@@ -412,11 +412,14 @@ class LokiVmCharm(ops.CharmBase):
             persist=lambda value: peer.data[self.app].__setitem__(RULE_CACHE_KEY, value),
         )
         logger.info(
-            "Rule delivery: received=%d accepted=%d rejected=%d groups=%d pending=%s",
+            "Rule delivery: received=%d admitted=%d rejected=%d last-accepted-groups=%d "
+            "applied-sources=%s applied-groups=%s pending=%s",
             result.received_sources,
             result.accepted_sources,
             len(result.rejected_sources),
             len(result.accepted_groups),
+            result.applied_sources if result.applied_sources is not None else "unknown",
+            result.applied_groups if result.applied_groups is not None else "unknown",
             not result.committed,
         )
         if not result.committed and isinstance(

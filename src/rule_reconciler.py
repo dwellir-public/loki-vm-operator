@@ -136,6 +136,8 @@ class RuleReconcileResult:
     received_sources: int = 0
     accepted_sources: int = 0
     rejected_sources: tuple[int, ...] = ()
+    applied_sources: int | None = None
+    applied_groups: int | None = None
 
 
 @dataclass(frozen=True)
@@ -489,7 +491,9 @@ class LokiRuleReconciler:
                 logger.warning(
                     "Rule sources rejected or over capacity: %s", errors[offset : offset + 16]
                 )
-        if not cache_valid and invalid_source:
+        if not cache_valid and (
+            invalid_source or any(source.raw_payload is None for source in ordered)
+        ):
             logger.warning(
                 "Cannot reconstruct complete Loki rule state from current relations; "
                 "leaving the ruler namespace unchanged"
@@ -518,7 +522,12 @@ class LokiRuleReconciler:
             )
             self._replay(previous.accepted_groups if cache_valid else live_before)
             return result(copy.deepcopy(previous.accepted_groups), False)
-        return result(copy.deepcopy(accepted_candidate), not invalid_source)
+        return result(
+            copy.deepcopy(accepted_candidate),
+            not invalid_source,
+            applied_sources=len(snapshots),
+            applied_groups=len(accepted_candidate),
+        )
 
     def _apply_candidate(
         self,

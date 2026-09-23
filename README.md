@@ -551,3 +551,7 @@ bounded request count. Other ruler namespaces are untouched.
 Ruler reads allow two bounded generations (16,384 groups, 20,000 rules and a
 16 MiB response) so an interrupted additions-before-removals update can resume.
 Desired admission limits remain 8,192 groups and 10,000 rules.
+
+Diagnostics distinguish admitted sources and last accepted groups from confirmed
+applied counts. Applied counts are `unknown` during partial or failed batches;
+pending state must not be interpreted as complete downstream coverage.
