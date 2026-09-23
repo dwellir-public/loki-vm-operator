@@ -1436,3 +1436,54 @@ def test_s3_relation_with_path_blocks(monkeypatch: pytest.MonkeyPatch):
     assert state_out.unit_status == testing.BlockedStatus(
         "s3 relation field 'path' is not supported"
     )
+
+
+@pytest.mark.parametrize("event_name", ["start", "upgrade_charm"])
+def test_incomplete_rules_remain_waiting_after_lifecycle_event(monkeypatch, event_name):
+    """Lifecycle health must not hide an incomplete rule delivery."""
+    ctx = _context()
+    source = testing.Relation(
+        "loki_push_api",
+        id=7,
+        remote_app_name="source",
+        remote_app_data={"alert_rules": "malformed"},
+    )
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr(
+        LokiVmCharm, "_read_config_from_disk", lambda self: self._render_config_text()
+    )
+    out = ctx.run(
+        getattr(ctx.on, event_name)(), testing.State(leader=True, relations=[source, peer])
+    )
+    assert out.unit_status.name == "waiting"
+    assert out.unit_status.message.startswith("Alert rules incomplete")
+
+
+@pytest.mark.parametrize("message", ["Alert rules incomplete: retry", "Unrelated dependency"])
+def test_rule_recovery_clears_only_rule_owned_waiting(monkeypatch, message):
+    """Successful rule delivery cannot clear an unrelated waiting status."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr(
+        LokiVmCharm, "_runtime_health_status", lambda self: testing.ActiveStatus("ready")
+    )
+    out = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(
+            leader=True,
+            relations=[source, peer],
+            unit_status=testing.WaitingStatus(message),
+        ),
+    )
+    expected = (
+        testing.ActiveStatus("ready")
+        if message.startswith("Alert rules incomplete")
+        else testing.WaitingStatus(message)
+    )
+    assert out.unit_status == expected

@@ -422,15 +422,22 @@ class LokiVmCharm(ops.CharmBase):
             result.applied_groups if result.applied_groups is not None else "unknown",
             not result.committed,
         )
-        if not result.committed and isinstance(
+        rule_status_owned = isinstance(
             self.unit.status, (ops.ActiveStatus, ops.WaitingStatus)
-        ):
+        ) or (self.unit.status == ops.MaintenanceStatus("starting workload"))
+        if not result.committed and rule_status_owned:
             self.unit.status = ops.WaitingStatus(
                 "Alert rules incomplete: "
                 f"{result.accepted_sources}/{result.received_sources} sources accepted; "
                 f"{len(result.rejected_sources)} rejected; inspect unit logs"
             )
-        return True
+        elif (
+            result.committed
+            and isinstance(self.unit.status, ops.WaitingStatus)
+            and self.unit.status.message.startswith("Alert rules incomplete:")
+        ):
+            self.unit.status = self._runtime_health_status()
+        return result.committed
 
     def _fast_reconcile_rolling_restart(self) -> None:
         """Advance rolling restart state without rewriting config."""
