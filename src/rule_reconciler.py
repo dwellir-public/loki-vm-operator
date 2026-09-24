@@ -671,7 +671,10 @@ class LokiRulerApiClient:
                 body.extend(chunk)
             budget.check_deadline()
             try:
-                document = yaml.safe_load(bytes(body).decode("utf-8"))
+                document = yaml.load(
+                    bytes(body).decode("utf-8"),
+                    Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader),
+                )
             except (RecursionError, UnicodeError, yaml.YAMLError) as exc:
                 raise InvalidRuleSnapshotError("Loki ruler response is invalid") from exc
             budget.check_deadline()
@@ -739,7 +742,9 @@ class LokiRulerApiClient:
             url = self._namespace_url
             body = None
             if method == "POST":
-                body = yaml.safe_dump(group, sort_keys=False)
+                body = yaml.dump(
+                    group, Dumper=getattr(yaml, "CSafeDumper", yaml.SafeDumper), sort_keys=False
+                )
                 headers["Content-Type"] = "application/yaml"
             else:
                 url += "/" + quote(name, safe="")

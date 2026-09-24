@@ -945,3 +945,88 @@ def test_resume_reads_two_generations_while_desired_capacity_stays_bounded(monke
     assert session.mutations == 2
     with pytest.raises(InvalidRuleSnapshotError):
         client.replace_namespace([*desired, _group("too-many")])
+
+
+@pytest.mark.parametrize("accelerated", [True, False])
+@pytest.mark.parametrize("shape", ["namespace", "groups", "list"])
+def test_safe_yaml_implementations_preserve_response_shapes(monkeypatch, accelerated, shape):
+    if not accelerated:
+        monkeypatch.delattr(yaml, "CSafeLoader", raising=False)
+        monkeypatch.delattr(yaml, "CSafeDumper", raising=False)
+    expected_loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    original_load = yaml.load
+    loaders = []
+
+    def load(document, **kwargs):
+        loaders.append(kwargs["Loader"])
+        return original_load(document, **kwargs)
+
+    monkeypatch.setattr(yaml, "load", load)
+    groups = [_group("example")]
+    document = {
+        "namespace": {LokiRulerApiClient.NAMESPACE: groups},
+        "groups": {"groups": groups},
+        "list": groups,
+    }[shape]
+    for body in (json.dumps(document), yaml.safe_dump(document)):
+        response = FakeResponse(200, body)
+        session = FakeSession([response])
+        assert (
+            LokiRulerApiClient("http://fixture", session=session).replace_namespace(groups)
+            == groups
+        )
+        assert response.closed
+        assert len(session.requests) == 1
+    assert loaders == [expected_loader, expected_loader]
+
+
+@pytest.mark.parametrize("accelerated", [True, False])
+@pytest.mark.parametrize("kind", ["unsafe_tag", "recursive_alias", "depth", "nodes"])
+def test_safe_yaml_implementations_reject_unsafe_bounded_responses(monkeypatch, accelerated, kind):
+    import rule_reconciler as module
+
+    if not accelerated:
+        monkeypatch.delattr(yaml, "CSafeLoader", raising=False)
+    payloads = {
+        "unsafe_tag": "!!python/object/apply:os.system ['false']",
+        "recursive_alias": (
+            f"{LokiRulerApiClient.NAMESPACE}: [{{name: bad, rules: [], extra: &a [*a]}}]"
+        ),
+        "depth": f"{LokiRulerApiClient.NAMESPACE}: [{{name: deep, rules: [], extra: "
+        + "[" * 40
+        + "0"
+        + "]" * 40
+        + "}]",
+        "nodes": json.dumps(
+            {LokiRulerApiClient.NAMESPACE: [dict(_group("wide"), extra=[0] * 100)]}
+        ),
+    }
+    if kind == "nodes":
+        monkeypatch.setattr(module, "MAX_CACHE_NODES", 64)
+    response = FakeResponse(200, payloads[kind])
+    session = FakeSession([response])
+    with pytest.raises(InvalidRuleSnapshotError):
+        LokiRulerApiClient("http://fixture", session=session).replace_namespace([])
+    assert response.closed
+    assert [request[0] for request in session.requests] == ["GET"]
+
+
+@pytest.mark.parametrize("accelerated", [True, False])
+def test_safe_yaml_dump_preserves_group_content(monkeypatch, accelerated):
+    if not accelerated:
+        monkeypatch.delattr(yaml, "CSafeDumper", raising=False)
+    expected_dumper = getattr(yaml, "CSafeDumper", yaml.SafeDumper)
+    original_dump = yaml.dump
+    dumpers = []
+
+    def dump(document, **kwargs):
+        dumpers.append(kwargs["Dumper"])
+        return original_dump(document, **kwargs)
+
+    monkeypatch.setattr(yaml, "dump", dump)
+    group = _group("quoted", 'sum(rate(errors_total{job="demo"}[5m])) > 0')
+    group["rules"][0]["annotations"] = {"summary": "yes: unicode å\nsecond line"}
+    session = FakeSession([FakeResponse(200, "[]"), FakeResponse(202)])
+    assert LokiRulerApiClient("http://fixture", session=session).replace_namespace([group]) == []
+    assert yaml.safe_load(session.requests[1][2]["data"]) == group
+    assert dumpers == [expected_dumper]
