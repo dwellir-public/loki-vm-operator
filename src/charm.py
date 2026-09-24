@@ -257,8 +257,13 @@ class LokiVmCharm(ops.CharmBase):
 
     def _on_loki_alert_rules_changed(self, event: ops.EventBase) -> None:
         """Reconcile standard provider alert-rule changes into Loki's ruler."""
-        self._refresh_loki_provider_endpoint()
-        self._reconcile_rules()
+        # Canonical lifecycle replay supplies a relation but no app/unit context.
+        # Keep that replay global; real source events identify their application.
+        relation = getattr(event, "relation", None) if getattr(event, "app", None) else None
+        if relation is not None and relation not in self.model.relations.get("loki_push_api", []):
+            relation = None
+        self._refresh_loki_provider_endpoint(relation=relation)
+        self._reconcile_rules(publication_relation=relation)
 
     def _on_loki_push_api_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
         """Withdraw the broken relation even while Juju still exposes stale data."""
@@ -373,7 +378,12 @@ class LokiVmCharm(ops.CharmBase):
         self.unit.status = self._runtime_health_status()
         self._reconcile_rules()
 
-    def _reconcile_rules(self, *, excluded_relation_id: int | None = None) -> bool:
+    def _reconcile_rules(
+        self,
+        *,
+        excluded_relation_id: int | None = None,
+        publication_relation: ops.Relation | None = None,
+    ) -> bool:
         """Apply bounded relation rules and persist accepted state in peer app data."""
         if not self._is_leader():
             return True
@@ -381,7 +391,12 @@ class LokiVmCharm(ops.CharmBase):
         if peer is None:
             logger.warning("Cannot reconcile Loki rules until the replicas relation is available")
             return True
-        for relation in self.model.relations.get("loki_push_api", []):
+        publication_relations = (
+            [publication_relation]
+            if publication_relation is not None
+            else self.model.relations.get("loki_push_api", [])
+        )
+        for relation in publication_relations:
             relation.data[self.app][transport.ENCODINGS_KEY] = transport.ENCODINGS
         sources = [
             RelationRuleSource(
@@ -1068,14 +1083,14 @@ class LokiVmCharm(ops.CharmBase):
             return True
         return False
 
-    def _refresh_loki_provider_endpoint(self) -> None:
+    def _refresh_loki_provider_endpoint(self, relation: ops.Relation | None = None) -> None:
         """Publish Loki push API endpoint to relation data."""
         if self._external_url_configured() and not self._is_leader():
-            self._clear_loki_provider_endpoint()
+            self._clear_loki_provider_endpoint(relation=relation)
             return
         url = self._external_url_base()
         if url:
-            self.loki_provider.update_endpoint(url=url)
+            self.loki_provider.update_endpoint(url=url, relation=relation)
 
     def _refresh_grafana_source_endpoint(self) -> None:
         """Refresh the endpoint published on `grafana-source` relations.
@@ -1107,9 +1122,12 @@ class LokiVmCharm(ops.CharmBase):
         """Return True when this unit is the leader."""
         return self.unit.is_leader()
 
-    def _clear_loki_provider_endpoint(self) -> None:
-        """Clear the published endpoint on this unit's relation data."""
-        for relation in self.model.relations.get("loki_push_api", []):
+    def _clear_loki_provider_endpoint(self, relation: ops.Relation | None = None) -> None:
+        """Clear this unit's endpoint on the selected relation, or all sources."""
+        relations = (
+            [relation] if relation is not None else self.model.relations.get("loki_push_api", [])
+        )
+        for relation in relations:
             relation.data[self.unit].pop("endpoint", None)
 
     def _clear_grafana_source_endpoint(self) -> None:

@@ -1487,3 +1487,118 @@ def test_rule_recovery_clears_only_rule_owned_waiting(monkeypatch, message):
         else testing.WaitingStatus(message)
     )
     assert out.unit_status == expected
+
+
+@pytest.mark.parametrize("leader", [True, False])
+@pytest.mark.parametrize("malformed_other", [True, False])
+def test_source_publication_does_not_load_unrelated_local_bags(
+    monkeypatch, leader, malformed_other
+):
+    """A source event targets local publication while retaining the full rule inventory."""
+    import ops.model
+
+    source, other = _rule_relation("first", 7), _rule_relation("second", 8)
+    if malformed_other:
+        other.remote_app_data["alert_rules"] = "invalid-json"
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    accesses = []
+    original = ops.model.RelationData.__getitem__
+
+    def record(data, entity):
+        accesses.append((data.relation.id, entity.name))
+        return original(data, entity)
+
+    monkeypatch.setattr(ops.model.RelationData, "__getitem__", record)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    _FakeRulerApi.calls = []
+    ctx = _context()
+    out = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(
+            leader=leader,
+            unit_status=testing.ActiveStatus(),
+            relations=[source, other, peer],
+            config={"external-url": "https://logs.example.com"},
+        ),
+    )
+    assert (8, "loki-vm") not in accesses
+    assert (8, "loki-vm/0") not in accesses
+    if leader:
+        assert (8, "second") in accesses
+        if malformed_other:
+            assert {g["name"] for g in _FakeRulerApi.calls[-1]} == {"first-group"}
+            assert "Alert rules incomplete" in out.unit_status.message
+        else:
+            assert {g["name"] for g in _FakeRulerApi.calls[-1]} == {"first-group", "second-group"}
+        assert out.get_relation(7).local_app_data["alert_rules_encodings"]
+    else:
+        assert _FakeRulerApi.calls == []
+        assert not out.get_relation(7).local_app_data
+
+
+@pytest.mark.parametrize("leader", [True, False])
+def test_global_endpoint_refresh_still_targets_every_source(monkeypatch, leader):
+    """Global endpoint rotation and follower clearing still cover every source."""
+    sources = [
+        testing.Relation("loki_push_api", id=i, local_unit_data={"endpoint": "old"})
+        for i in (7, 8)
+    ]
+    ctx = _context()
+    with ctx(
+        ctx.on.update_status(),
+        testing.State(
+            leader=leader, relations=sources, config={"external-url": "https://new.example.com"}
+        ),
+    ) as manager:
+        manager.charm._refresh_loki_provider_endpoint()
+        for relation in manager.charm.model.relations["loki_push_api"]:
+            bag = relation.data[manager.charm.unit]
+            assert ("new.example.com" in bag["endpoint"]) if leader else "endpoint" not in bag
+
+
+def test_synthetic_provider_lifecycle_keeps_global_publication(monkeypatch):
+    """Canonical upgrade replay's first relation must not narrow global recovery."""
+    source, other = _rule_relation("first", 7), _rule_relation("second", 8)
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    ctx = _context()
+    with ctx(
+        ctx.on.update_status(),
+        testing.State(
+            leader=True,
+            relations=[source, other, peer],
+            config={"external-url": "https://new.example.com"},
+        ),
+    ) as manager:
+        charm = manager.charm
+        relation = charm.model.get_relation("loki_push_api", 7)
+        charm._on_loki_alert_rules_changed(SimpleNamespace(relation=relation, app=None, unit=None))
+        for item in charm.model.relations["loki_push_api"]:
+            assert "new.example.com" in item.data[charm.unit]["endpoint"]
+            assert item.data[charm.app]["alert_rules_encodings"]
+
+
+def test_removed_source_event_only_publishes_to_remaining_inventory(monkeypatch):
+    """A late custom event must not write a removed relation's bags."""
+    from unittest.mock import Mock
+
+    source = _rule_relation("remaining", 7)
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    ctx = _context()
+    with ctx(
+        ctx.on.update_status(),
+        testing.State(
+            leader=True,
+            relations=[source, peer],
+        ),
+    ) as manager:
+        removed = Mock()
+        manager.charm._on_loki_alert_rules_changed(
+            SimpleNamespace(relation=removed, app=manager.charm.app)
+        )
+        assert removed.mock_calls == []
+        relation = manager.charm.model.get_relation("loki_push_api", 7)
+        assert relation is not None
+        assert relation.data[manager.charm.unit]["endpoint"]
+        assert relation.data[manager.charm.app]["alert_rules_encodings"]
