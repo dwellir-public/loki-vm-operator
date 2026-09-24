@@ -14,9 +14,11 @@ import json
 import lzma
 from collections.abc import Mapping
 
+from cosl import LZMABase64
+
 LIBID = "ad340c8efce34907b8119d019b0f6100"
 LIBAPI = 0
-LIBPATCH = 1
+LIBPATCH = 2
 
 ENCODINGS_KEY = "alert_rules_encodings"
 ENCODINGS = '["lzma", "json"]'
@@ -36,7 +38,7 @@ def encoding(remote: Mapping[str, str] | None) -> str:
 
 def compress(raw: bytes) -> str:
     """Encode canonical xz/base64 using a bounded encoder dictionary."""
-    return base64.b64encode(lzma.compress(raw, preset=6)).decode("ascii")
+    return LZMABase64.compress(raw.decode("utf-8"))
 
 
 def decompress(raw: str, *, maximum: int = DECODED_LIMIT) -> bytes:
@@ -83,11 +85,14 @@ def encode(raw: str, remote: Mapping[str, str] | None, *, wire_limit: int = WIRE
     return result
 
 
-def admit(sources, previous, parser, *, maximum=1024):
+def admit(sources, previous, parser):
     """Admit rule-bearing sources, preserving existing owners before newcomers.
 
     Absent data is not a deletion; an explicit empty document withdraws rules.
-    Return bounded diagnostic relation IDs alongside last-known-good snapshots.
+    Source count is not a capacity policy. Retained decoded bytes remain bounded.
+    Decode each compressed source once before semantic validation; this avoids
+    a fixed per-hook decode cutoff permanently starving higher-ID sources.
+    Ruler writes are separately resumable in the backend reconciler.
     """
     current = dict(sources)
     snapshots = {key: groups for key, groups in previous.items() if key in current and groups}
@@ -97,28 +102,18 @@ def admit(sources, previous, parser, *, maximum=1024):
         for key, groups in snapshots.items()
     }
     total = sum(sizes.values())
-    decoded_work = 0
     for key in sorted(current, key=lambda key: (key not in snapshots, key)):
         raw = current[key]
         if raw is None:
             continue
-        if decoded_work >= 2 * DECODED_LIMIT:
-            errors.append(key)
-            continue
         try:
-            decoded_work += len(decode(raw).encode("utf-8"))
-            if decoded_work > 2 * DECODED_LIMIT:
-                errors.append(key)
-                continue
-            groups = parser(raw)
+            groups = parser(decode(raw))
         except ValueError:
             errors.append(key)
             continue
         size = len(json.dumps(groups, ensure_ascii=False).encode()) if groups else 0
         candidate_total = total - sizes.get(key, 0) + size
-        if candidate_total > DECODED_LIMIT or (
-            groups and key not in snapshots and len(snapshots) >= maximum
-        ):
+        if candidate_total > DECODED_LIMIT:
             errors.append(key)
             continue
         if groups:

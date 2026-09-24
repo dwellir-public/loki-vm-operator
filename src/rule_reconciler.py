@@ -42,7 +42,6 @@ def prepare_filesystem_rule_store(data_dir: str | Path) -> None:
 
 
 MAX_RELATION_VALUE_BYTES = 60 * 1024
-MAX_SOURCE_RELATIONS = 1024
 MAX_DOCUMENT_DEPTH = 32
 MAX_DOCUMENT_NODES = 500_000
 MAX_GROUP_NAME_BYTES = 512
@@ -405,8 +404,6 @@ def _decode_cache(encoded: str | None) -> _RuleCache:
         document["relations"], dict
     ):
         raise InvalidRuleCacheError("rule cache version or relation map is invalid")
-    if len(document["relations"]) > MAX_SOURCE_RELATIONS:
-        raise InvalidRuleCacheError("rule cache has too many relations")
     snapshots: dict[int, list[dict[str, Any]]] = {}
     for relation_id_text, groups in document["relations"].items():
         if (
@@ -477,7 +474,6 @@ class LokiRuleReconciler:
             [(source.relation_id, source.raw_payload) for source in ordered],
             previous.snapshots,
             parse_rule_groups,
-            maximum=MAX_SOURCE_RELATIONS,
         )
         result = partial(
             RuleReconcileResult,

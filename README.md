@@ -507,7 +507,8 @@ relation endpoint.
 
 ## Alert rule delivery capacity
 
-Rule admission counts rule-bearing source relations, with a limit of 1,024. Empty
+Rule admission has no fixed source-count cutoff. At least 1,024 is a validation
+target, not an admission ceiling. Empty
 telemetry relations do not consume slots. Existing sources retain their slots
 when a new source would exceed capacity. Malformed or temporarily missing updates
 retain their last valid rules; an explicit empty group list or relation removal
@@ -555,3 +556,25 @@ Desired admission limits remain 8,192 groups and 10,000 rules.
 Diagnostics distinguish admitted sources and last accepted groups from confirmed
 applied counts. Applied counts are `unknown` during partial or failed batches;
 pending state must not be interpreted as complete downstream coverage.
+
+
+### Upstream reuse and resource policies
+
+The experimental transport uses Canonical `cosl` for LZMA/base64 encoding.
+Local code retains strict decompression limits, negotiation integration and
+last-known-good source ownership; these are separate from the codec. Runtime
+packaging remains the existing vendored arrangement while the owner repository
+investigates whether a separate package is justified.
+
+Logical-source tests cover 1,025 realistic sources and 2,048 small sources through
+wire and cache recovery. A 2,048-source corpus with distinct topology values
+exceeds the existing 60 KiB wire policy and is explicitly rejected. This is an
+application policy, not a verified Juju limit. No count cutoff is reintroduced
+by cache readers. Memory, document-tree, group/rule and encoded-size policies
+still constrain usable capacity; unlimited source volume is not promised.
+
+Sources are decoded once before semantic validation. Removing the cumulative
+decode cutoff avoids permanent starvation by relation ID, but parsing work still
+scales with input volume per hook. Ruler writes retain resumable operation/time
+budgets. Host/controller scale and malformed-input CPU budgets require measurement
+before claiming production scale readiness; logical tests are not live relations.

@@ -20,7 +20,6 @@ from rule_reconciler import (
     MAX_CACHE_NODES,
     MAX_CACHE_VALUE_BYTES,
     MAX_RELATION_VALUE_BYTES,
-    MAX_SOURCE_RELATIONS,
     MAX_TOTAL_GROUPS,
     MAX_TOTAL_RULES,
     InvalidRuleCacheError,
@@ -113,11 +112,12 @@ def test_decode_cache_rejects_excessive_depth_and_nodes() -> None:
         _decode_cache(_encoded_cache(too_wide))
 
 
-def test_decode_cache_rejects_more_than_1024_cached_relations() -> None:
-    relations = {str(index): [] for index in range(MAX_SOURCE_RELATIONS + 1)}
+def test_decode_cache_accepts_more_than_1024_cached_relations() -> None:
+    relations = {str(index): [] for index in range(1025)}
 
-    with pytest.raises(InvalidRuleCacheError):
-        _decode_cache(_encoded_cache(_cache_document(relations=relations)))
+    assert (
+        len(_decode_cache(_encoded_cache(_cache_document(relations=relations))).snapshots) == 1025
+    )
 
 
 def test_decode_cache_normalizes_invalid_relation_snapshot_error() -> None:
@@ -567,7 +567,7 @@ def test_persist_failure_rolls_live_rules_back_to_prior_accepted_state() -> None
     assert [group["name"] for group in client.calls[-1]] == ["accepted"]
 
 
-def test_first_1024_rule_bearing_relation_ids_are_admitted() -> None:
+def test_all_1025_rule_bearing_relation_ids_are_admitted() -> None:
     client = FakeRulerClient()
     cache = ""
 
@@ -577,13 +577,11 @@ def test_first_1024_rule_bearing_relation_ids_are_admitted() -> None:
 
     sources = [
         RelationRuleSource(relation_id, _raw(_group(str(relation_id))))
-        for relation_id in range(MAX_SOURCE_RELATIONS + 1, 0, -1)
+        for relation_id in range(1025, 0, -1)
     ]
     result = LokiRuleReconciler(client).reconcile(sources, cache_value=cache, persist=persist)
 
-    assert [group["name"] for group in result.accepted_groups] == [
-        str(i) for i in range(1, MAX_SOURCE_RELATIONS + 1)
-    ]
+    assert [group["name"] for group in result.accepted_groups] == [str(i) for i in range(1, 1026)]
 
 
 def test_cached_aggregate_can_exceed_one_relation_value() -> None:
