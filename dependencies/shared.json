@@ -1,7 +1,7 @@
 [
   {
     "repository": "https://github.com/dwellir-public/dwellir-observability-reference",
-    "commit": "3792566d4d727a4be74e36c096dcb82d82b865da",
+    "commit": "2440d64c2009c8a5c783991829bfae7eea7ebfc7",
     "upstream_path": "shared/charms/dwellir_observability/v0/alert_rule_transport.py",
     "path": "lib/charms/dwellir_observability/v0/alert_rule_transport.py",
     "sha256": "46a778c06d8ebcd68fc71637f51e09124df21cc229b492b66b14deed190908d3",
@@ -10,7 +10,7 @@
   },
   {
     "repository": "https://github.com/dwellir-public/dwellir-observability-reference",
-    "commit": "3792566d4d727a4be74e36c096dcb82d82b865da",
+    "commit": "2440d64c2009c8a5c783991829bfae7eea7ebfc7",
     "upstream_path": "shared/charms/dwellir_observability/v0/source_admission.py",
     "path": "lib/charms/dwellir_observability/v0/source_admission.py",
     "sha256": "32b4912e7ca51b0c794edb4c593db543e64c6671314813f62e33a125a34ad954",
