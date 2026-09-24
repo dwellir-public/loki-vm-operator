@@ -25,6 +25,7 @@ from urllib.parse import quote
 import requests
 import yaml
 from charms.dwellir_observability.v0 import alert_rule_transport as transport
+from charms.dwellir_observability.v0 import source_admission
 
 logger = logging.getLogger(__name__)
 
@@ -470,7 +471,7 @@ class LokiRuleReconciler:
             previous = _RuleCache(snapshots={}, accepted_groups=[])
             cache_valid = False
         ordered = sorted(sources, key=lambda source: source.relation_id)
-        snapshots, errors = transport.admit(
+        snapshots, errors = source_admission.admit(
             [(source.relation_id, source.raw_payload) for source in ordered],
             previous.snapshots,
             parse_rule_groups,

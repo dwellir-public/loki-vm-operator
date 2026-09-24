@@ -518,9 +518,10 @@ incomplete delivery is reported in workload status.
 Receivers advertise `alert_rules_encodings` and accept legacy JSON plus Canonical's
 LZMA/base64 format in `alert_rules`. Senders compress only for advertising peers.
 There is no machine-observability schema change. The shared bounded adapter is
-owned by `dwellir-observability-reference`; publish that library before releasing
-consumer builds. Its candidate source is vendored byte-for-byte for coordinated
-review and local testing.
+owned by `dwellir-observability-reference` in `shared/charms/dwellir_observability/v0`.
+The transport and source-admission modules are vendored byte-for-byte, with owner
+commit, source paths and hashes recorded in `dependencies/shared.json`. Coordinate
+owner source review before consumer merges; no separate package publication is needed.
 
 The supported test corpus contains 1,024 sources and 4,096 groups/rules, including
 all five Juju topology labels, expressions, and runbook annotations. It is about
@@ -560,11 +561,11 @@ pending state must not be interpreted as complete downstream coverage.
 
 ### Upstream reuse and resource policies
 
-The experimental transport uses Canonical `cosl` for LZMA/base64 encoding.
+The shared transport uses Canonical `cosl` for LZMA/base64 encoding.
 Local code retains strict decompression limits, negotiation integration and
 last-known-good source ownership; these are separate from the codec. Runtime
-packaging remains the existing vendored arrangement while the owner repository
-investigates whether a separate package is justified.
+packaging uses pinned owner-source copies; the experimental Python package has
+been retired. Source admission is a separate helper from the wire codec.
 
 Logical-source tests cover 1,025 realistic sources and 2,048 small sources through
 wire and cache recovery. A 2,048-source corpus with distinct topology values
@@ -578,3 +579,16 @@ decode cutoff avoids permanent starvation by relation ID, but parsing work still
 scales with input volume per hook. Ruler writes retain resumable operation/time
 budgets. Host/controller scale and malformed-input CPU budgets require measurement
 before claiming production scale readiness; logical tests are not live relations.
+
+
+### Shared adapter provenance
+
+Normal unit tests verify the local adapter inventory, immutable owner pin and
+exact file hashes in `dependencies/shared.json`. Builds remain offline with
+respect to this source dependency. The owner repository is private: do not add
+an unauthenticated cross-repository CI fetch. During a coordinated update, use
+an authenticated owner checkout at the recorded commit and run its
+`tools/shared_adapters.py --consumer /path/to/this/charm` to compare both adapters
+with immutable Git objects and reviewed owner source. Update the manifest only
+with the reviewed owner change; local hash checks alone do not prove upstream
+origin. No package publication is required.

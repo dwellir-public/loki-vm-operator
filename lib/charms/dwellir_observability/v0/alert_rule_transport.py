@@ -16,10 +16,6 @@ from collections.abc import Mapping
 
 from cosl import LZMABase64
 
-LIBID = "ad340c8efce34907b8119d019b0f6100"
-LIBAPI = 0
-LIBPATCH = 2
-
 ENCODINGS_KEY = "alert_rules_encodings"
 ENCODINGS = '["lzma", "json"]'
 WIRE_LIMIT = 60 * 1024
@@ -37,7 +33,7 @@ def encoding(remote: Mapping[str, str] | None) -> str:
 
 
 def compress(raw: bytes) -> str:
-    """Encode canonical xz/base64 using a bounded encoder dictionary."""
+    """Encode canonical xz/base64 using the Canonical encoder."""
     return LZMABase64.compress(raw.decode("utf-8"))
 
 
@@ -83,44 +79,3 @@ def encode(raw: str, remote: Mapping[str, str] | None, *, wire_limit: int = WIRE
     if len(result.encode("utf-8")) >= wire_limit:
         raise ValueError("alert rules exceed receiver capacity for " + encoding(remote))
     return result
-
-
-def admit(sources, previous, parser):
-    """Admit rule-bearing sources, preserving existing owners before newcomers.
-
-    Absent data is not a deletion; an explicit empty document withdraws rules.
-    Source count is not a capacity policy. Retained decoded bytes remain bounded.
-    Decode each compressed source once before semantic validation; this avoids
-    a fixed per-hook decode cutoff permanently starving higher-ID sources.
-    Ruler writes are separately resumable in the backend reconciler.
-    """
-    current = dict(sources)
-    snapshots = {key: groups for key, groups in previous.items() if key in current and groups}
-    errors = []
-    sizes = {
-        key: len(json.dumps(groups, ensure_ascii=False).encode())
-        for key, groups in snapshots.items()
-    }
-    total = sum(sizes.values())
-    for key in sorted(current, key=lambda key: (key not in snapshots, key)):
-        raw = current[key]
-        if raw is None:
-            continue
-        try:
-            groups = parser(decode(raw))
-        except ValueError:
-            errors.append(key)
-            continue
-        size = len(json.dumps(groups, ensure_ascii=False).encode()) if groups else 0
-        candidate_total = total - sizes.get(key, 0) + size
-        if candidate_total > DECODED_LIMIT:
-            errors.append(key)
-            continue
-        if groups:
-            snapshots[key] = groups
-            sizes[key] = size
-        else:
-            snapshots.pop(key, None)
-            sizes.pop(key, None)
-        total = candidate_total
-    return snapshots, errors
