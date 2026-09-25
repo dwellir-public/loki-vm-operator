@@ -378,10 +378,10 @@ def test_broken_rule_relation_withdraws_its_groups(monkeypatch: pytest.MonkeyPat
     assert _FakeRulerApi.calls[-1] == []
 
 
-def test_relation_changed_with_omitted_rules_withdraws_snapshot(
+def test_relation_changed_with_omitted_rules_retains_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Removing alert_rules from an extant app databag must reconcile withdrawal."""
+    """Missing data during publication must retain the accepted source snapshot."""
     ctx = _context()
     source = _rule_relation()
     peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
@@ -405,7 +405,8 @@ def test_relation_changed_with_omitted_rules_withdraws_snapshot(
         testing.State(leader=True, relations=[source_without_rules, peer_out]),
     )
 
-    assert _FakeRulerApi.calls[-1] == []
+    assert _FakeRulerApi.calls[-1] == _FakeRulerApi.calls[0]
+    assert _FakeRulerApi.calls[-1]
 
 
 def test_rule_relation_changed_republishes_configured_push_endpoint(
@@ -1435,3 +1436,169 @@ def test_s3_relation_with_path_blocks(monkeypatch: pytest.MonkeyPatch):
     assert state_out.unit_status == testing.BlockedStatus(
         "s3 relation field 'path' is not supported"
     )
+
+
+@pytest.mark.parametrize("event_name", ["start", "upgrade_charm"])
+def test_incomplete_rules_remain_waiting_after_lifecycle_event(monkeypatch, event_name):
+    """Lifecycle health must not hide an incomplete rule delivery."""
+    ctx = _context()
+    source = testing.Relation(
+        "loki_push_api",
+        id=7,
+        remote_app_name="source",
+        remote_app_data={"alert_rules": "malformed"},
+    )
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr("charm.loki.ensure_data_dir", lambda _: None)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", lambda *_, **__: None)
+    monkeypatch.setattr(
+        LokiVmCharm, "_read_config_from_disk", lambda self: self._render_config_text()
+    )
+    out = ctx.run(
+        getattr(ctx.on, event_name)(), testing.State(leader=True, relations=[source, peer])
+    )
+    assert out.unit_status.name == "waiting"
+    assert out.unit_status.message.startswith("Alert rules incomplete")
+
+
+@pytest.mark.parametrize("message", ["Alert rules incomplete: retry", "Unrelated dependency"])
+def test_rule_recovery_clears_only_rule_owned_waiting(monkeypatch, message):
+    """Successful rule delivery cannot clear an unrelated waiting status."""
+    ctx = _context()
+    source = _rule_relation()
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    monkeypatch.setattr(
+        LokiVmCharm, "_runtime_health_status", lambda self: testing.ActiveStatus("ready")
+    )
+    out = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(
+            leader=True,
+            relations=[source, peer],
+            unit_status=testing.WaitingStatus(message),
+        ),
+    )
+    expected = (
+        testing.ActiveStatus("ready")
+        if message.startswith("Alert rules incomplete")
+        else testing.WaitingStatus(message)
+    )
+    assert out.unit_status == expected
+
+
+@pytest.mark.parametrize("leader", [True, False])
+@pytest.mark.parametrize("malformed_other", [True, False])
+def test_source_publication_does_not_load_unrelated_local_bags(
+    monkeypatch, leader, malformed_other
+):
+    """A source event targets local publication while retaining the full rule inventory."""
+    import ops.model
+
+    source, other = _rule_relation("first", 7), _rule_relation("second", 8)
+    if malformed_other:
+        other.remote_app_data["alert_rules"] = "invalid-json"
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    accesses = []
+    original = ops.model.RelationData.__getitem__
+
+    def record(data, entity):
+        accesses.append((data.relation.id, entity.name))
+        return original(data, entity)
+
+    monkeypatch.setattr(ops.model.RelationData, "__getitem__", record)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    _FakeRulerApi.calls = []
+    ctx = _context()
+    out = ctx.run(
+        ctx.on.relation_changed(source),
+        testing.State(
+            leader=leader,
+            unit_status=testing.ActiveStatus(),
+            relations=[source, other, peer],
+            config={"external-url": "https://logs.example.com"},
+        ),
+    )
+    assert (8, "loki-vm") not in accesses
+    assert (8, "loki-vm/0") not in accesses
+    if leader:
+        assert (8, "second") in accesses
+        if malformed_other:
+            assert {g["name"] for g in _FakeRulerApi.calls[-1]} == {"first-group"}
+            assert "Alert rules incomplete" in out.unit_status.message
+        else:
+            assert {g["name"] for g in _FakeRulerApi.calls[-1]} == {"first-group", "second-group"}
+        assert out.get_relation(7).local_app_data["alert_rules_encodings"]
+    else:
+        assert _FakeRulerApi.calls == []
+        assert not out.get_relation(7).local_app_data
+
+
+@pytest.mark.parametrize("leader", [True, False])
+def test_global_endpoint_refresh_still_targets_every_source(monkeypatch, leader):
+    """Global endpoint rotation and follower clearing still cover every source."""
+    sources = [
+        testing.Relation("loki_push_api", id=i, local_unit_data={"endpoint": "old"})
+        for i in (7, 8)
+    ]
+    ctx = _context()
+    with ctx(
+        ctx.on.update_status(),
+        testing.State(
+            leader=leader, relations=sources, config={"external-url": "https://new.example.com"}
+        ),
+    ) as manager:
+        manager.charm._refresh_loki_provider_endpoint()
+        for relation in manager.charm.model.relations["loki_push_api"]:
+            bag = relation.data[manager.charm.unit]
+            assert ("new.example.com" in bag["endpoint"]) if leader else "endpoint" not in bag
+
+
+def test_synthetic_provider_lifecycle_keeps_global_publication(monkeypatch):
+    """Canonical upgrade replay's first relation must not narrow global recovery."""
+    source, other = _rule_relation("first", 7), _rule_relation("second", 8)
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    ctx = _context()
+    with ctx(
+        ctx.on.update_status(),
+        testing.State(
+            leader=True,
+            relations=[source, other, peer],
+            config={"external-url": "https://new.example.com"},
+        ),
+    ) as manager:
+        charm = manager.charm
+        relation = charm.model.get_relation("loki_push_api", 7)
+        charm._on_loki_alert_rules_changed(SimpleNamespace(relation=relation, app=None, unit=None))
+        for item in charm.model.relations["loki_push_api"]:
+            assert "new.example.com" in item.data[charm.unit]["endpoint"]
+            assert item.data[charm.app]["alert_rules_encodings"]
+
+
+def test_removed_source_event_only_publishes_to_remaining_inventory(monkeypatch):
+    """A late custom event must not write a removed relation's bags."""
+    from unittest.mock import Mock
+
+    source = _rule_relation("remaining", 7)
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    ctx = _context()
+    with ctx(
+        ctx.on.update_status(),
+        testing.State(
+            leader=True,
+            relations=[source, peer],
+        ),
+    ) as manager:
+        removed = Mock()
+        manager.charm._on_loki_alert_rules_changed(
+            SimpleNamespace(relation=removed, app=manager.charm.app)
+        )
+        assert removed.mock_calls == []
+        relation = manager.charm.model.get_relation("loki_push_api", 7)
+        assert relation is not None
+        assert relation.data[manager.charm.unit]["endpoint"]
+        assert relation.data[manager.charm.app]["alert_rules_encodings"]
