@@ -10,6 +10,7 @@ import binascii
 import copy
 import json
 import logging
+import lzma
 import math
 import re
 import time
@@ -24,10 +25,31 @@ from urllib.parse import quote
 
 import requests
 import yaml
-from charms.dwellir_observability.v0 import alert_rule_transport as transport
-from charms.dwellir_observability.v0 import source_admission
+from cosl import LZMABase64
 
 logger = logging.getLogger(__name__)
+
+MAX_RULE_BYTES = 8 * 1024 * 1024
+
+
+def _decompress_rules(raw: str, *, maximum: int = MAX_RULE_BYTES) -> bytes:
+    """Decode exactly one XZ stream with bounded output and dictionary memory."""
+    try:
+        decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=64 * 1024 * 1024)
+        result = decoder.decompress(base64.b64decode(raw, validate=True), max_length=maximum + 1)
+        if len(result) > maximum or not decoder.eof or decoder.unused_data:
+            raise ValueError("compressed rules exceed bounds or contain trailing data")
+        return result
+    except (binascii.Error, lzma.LZMAError, UnicodeError) as exc:
+        raise ValueError("invalid compressed rules") from exc
+
+
+def _rule_text(raw: str) -> str:
+    """Accept legacy JSON and Canonical bare or JSON-wrapped XZ/base64."""
+    value = json.loads(raw) if raw.strip().startswith('"') else raw.strip()
+    if isinstance(value, str) and value.startswith("/Td6WFoA"):
+        return _decompress_rules(value).decode("utf-8")
+    return raw
 
 
 def prepare_filesystem_rule_store(data_dir: str | Path) -> None:
@@ -265,7 +287,7 @@ def parse_rule_groups(raw_payload: str | None) -> list[dict[str, Any]]:
         raise InvalidRuleSnapshotError("alert_rules exceeds the safe size limit")
     try:
         document = json.loads(
-            transport.decode(raw_payload, wire_limit=MAX_RELATION_VALUE_BYTES),
+            _rule_text(raw_payload),
             object_pairs_hook=_unique_object,
             parse_constant=_reject_constant,
         )
@@ -329,7 +351,7 @@ def _decompress_cache(encoded: str) -> bytes:
         if len(encoded.encode("utf-8")) >= MAX_CACHE_VALUE_BYTES:
             raise InvalidRuleCacheError("rule cache exceeds the safe size limit")
         if encoded.startswith("xz:"):
-            return transport.decompress(encoded[3:], maximum=MAX_CACHE_DECODED_BYTES)
+            return _decompress_rules(encoded[3:], maximum=MAX_CACHE_DECODED_BYTES)
         compressed = base64.b64decode(encoded, validate=True)
         decompressor = zlib.decompressobj()
         raw = decompressor.decompress(compressed, MAX_CACHE_DECODED_BYTES + 1)
@@ -373,7 +395,9 @@ def _validate_cached_snapshot(groups: Any) -> list[dict[str, Any]]:
             allow_nan=False,
         )
         return parse_rule_groups(
-            transport.encode(serialized, {transport.ENCODINGS_KEY: transport.ENCODINGS})
+            serialized
+            if len(serialized.encode("utf-8")) < MAX_RELATION_VALUE_BYTES
+            else LZMABase64.compress(serialized)
         )
     except (InvalidRuleSnapshotError, TypeError, UnicodeError, ValueError) as exc:
         raise InvalidRuleCacheError("rule cache relation snapshot is invalid") from exc
@@ -442,7 +466,7 @@ def _encode_cache(cache: _RuleCache) -> str:
         raise InvalidRuleCacheError("rule cache candidate is invalid") from exc
     if len(raw) > MAX_CACHE_DECODED_BYTES:
         raise InvalidRuleCacheError("rule cache decoded content exceeds safe bounds")
-    encoded = "xz:" + transport.compress(raw)
+    encoded = "xz:" + LZMABase64.compress(raw.decode("utf-8"))
     if len(encoded.encode("utf-8")) >= MAX_CACHE_VALUE_BYTES:
         raise InvalidRuleCacheError("rule cache value exceeds the safe size limit")
     return encoded
@@ -455,7 +479,7 @@ class LokiRuleReconciler:
         """Bind the reconciler to a replace-capable Loki ruler client."""
         self._client = client
 
-    def reconcile(
+    def reconcile(  # noqa: C901 - retain source admission beside its transaction.
         self,
         sources: Iterable[RelationRuleSource],
         *,
@@ -471,11 +495,38 @@ class LokiRuleReconciler:
             previous = _RuleCache(snapshots={}, accepted_groups=[])
             cache_valid = False
         ordered = sorted(sources, key=lambda source: source.relation_id)
-        snapshots, errors = source_admission.admit(
-            [(source.relation_id, source.raw_payload) for source in ordered],
-            previous.snapshots,
-            parse_rule_groups,
-        )
+        current = {source.relation_id: source.raw_payload for source in ordered}
+        snapshots = {
+            key: groups for key, groups in previous.snapshots.items() if key in current and groups
+        }
+        errors: list[int] = []
+        sizes = {
+            key: len(json.dumps(groups, ensure_ascii=False).encode())
+            for key, groups in snapshots.items()
+        }
+        total = sum(sizes.values())
+        # Existing ownership is considered before newcomers; source count is not a budget.
+        for key in sorted(current, key=lambda key: (key not in snapshots, key)):
+            raw = current[key]
+            if raw is None:
+                continue
+            try:
+                groups = parse_rule_groups(raw)
+            except ValueError:
+                errors.append(key)
+                continue
+            size = len(json.dumps(groups, ensure_ascii=False).encode()) if groups else 0
+            candidate_total = total - sizes.get(key, 0) + size
+            if candidate_total > MAX_RULE_BYTES:
+                errors.append(key)
+                continue
+            if groups:
+                snapshots[key] = groups
+                sizes[key] = size
+            else:
+                snapshots.pop(key, None)
+                sizes.pop(key, None)
+            total = candidate_total
         result = partial(
             RuleReconcileResult,
             received_sources=len(ordered),

@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 
 import ops
 import yaml
-from charms.dwellir_observability.v0 import alert_rule_transport as transport
 from charms.grafana_k8s.v0.grafana_source import GrafanaSourceData, GrafanaSourceProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
 from charms.traefik_k8s.v1.ingress_per_unit import IngressPerUnitRequirer
@@ -397,7 +396,7 @@ class LokiVmCharm(ops.CharmBase):
             else self.model.relations.get("loki_push_api", [])
         )
         for relation in publication_relations:
-            relation.data[self.app][transport.ENCODINGS_KEY] = transport.ENCODINGS
+            relation.data[self.app]["alert_rules_encodings"] = '["lzma", "json"]'
         sources = [
             RelationRuleSource(
                 relation.id,

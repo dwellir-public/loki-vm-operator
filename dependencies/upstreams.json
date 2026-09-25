@@ -1,0 +1,26 @@
+{
+  "cosl": {
+    "repository": "https://github.com/canonical/cos-lib",
+    "role": "runtime",
+    "distribution": "cosl",
+    "source_path": "src/cosl"
+  },
+  "grafana_source": {
+    "repository": "https://github.com/canonical/grafana-k8s-operator",
+    "role": "runtime-vendored",
+    "source_path": "lib/charms/grafana_k8s/v0/grafana_source.py",
+    "distribution": null
+  },
+  "loki_push_api": {
+    "repository": "https://github.com/canonical/loki-k8s-operator",
+    "role": "runtime-vendored",
+    "source_path": "lib/charms/loki_k8s/v1/loki_push_api.py",
+    "distribution": null
+  },
+  "ingress_per_unit": {
+    "repository": "https://github.com/canonical/traefik-k8s-operator",
+    "role": "runtime-vendored",
+    "source_path": "lib/charms/traefik_k8s/v1/ingress_per_unit.py",
+    "distribution": null
+  }
+}

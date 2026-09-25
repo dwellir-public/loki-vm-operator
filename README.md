@@ -507,23 +507,21 @@ relation endpoint.
 
 ## Alert rule delivery capacity
 
-Rule admission has no fixed source-count cutoff. At least 1,024 is a validation
-target, not an admission ceiling. Empty
-telemetry relations do not consume slots. Existing sources retain their slots
-when a new source would exceed capacity. Malformed or temporarily missing updates
+Rule admission has no fixed source-count cutoff. The unit-test corpus includes
+1,024 logical sources; this does not claim validation of 1,024 live Juju relations.
+Empty telemetry relations do not consume the rule-byte budget. Existing source
+ownership takes priority when a new source would exceed that budget. Malformed or temporarily missing updates
 retain their last valid rules; an explicit empty group list or relation removal
 withdraws them. Rejected relation IDs and delivery counts appear in unit logs;
 incomplete delivery is reported in workload status.
 
 Receivers advertise `alert_rules_encodings` and accept legacy JSON plus Canonical's
 LZMA/base64 format in `alert_rules`. Senders compress only for advertising peers.
-There is no machine-observability schema change. The shared bounded adapter is
-owned by `dwellir-observability-reference` in `shared/charms/dwellir_observability/v0`.
-The transport and source-admission modules are vendored byte-for-byte, with owner
-commit, source paths and hashes recorded in `dependencies/shared.json`. Coordinate
-owner source review before consumer merges; no separate package publication is needed.
+There is no machine-observability schema change. Rule publication uses the public
+Canonical `cosl.LZMABase64` encoder. Each receiver bounds its own untrusted XZ
+decoding and retains source ownership inside its existing reconciler or bridge.
 
-The supported test corpus contains 1,024 sources and 4,096 groups/rules, including
+The logical unit-test corpus contains 1,024 sources and 4,096 groups/rules, including
 all five Juju topology labels, expressions, and runbook annotations. It is about
 3.4 MB as JSON and 54 KB after LZMA/base64. Every encoded relation value must remain
 below 60 KiB; decoded rule documents are limited to 8 MiB and LZMA decoder memory to
@@ -561,7 +559,7 @@ pending state must not be interpreted as complete downstream coverage.
 
 ### Upstream reuse and resource policies
 
-The shared transport uses Canonical `cosl` for LZMA/base64 encoding.
+Rule publication uses Canonical `cosl` for LZMA/base64 encoding.
 Local code retains strict decompression limits, negotiation integration and
 last-known-good source ownership; these are separate from the codec. Runtime
 packaging uses pinned owner-source copies; the experimental Python package has
@@ -581,14 +579,9 @@ budgets. Host/controller scale and malformed-input CPU budgets require measureme
 before claiming production scale readiness; logical tests are not live relations.
 
 
-### Shared adapter provenance
+### Rule transport maintenance
 
-Normal unit tests verify the local adapter inventory, immutable owner pin and
-exact file hashes in `dependencies/shared.json`. Builds remain offline with
-respect to this source dependency. The owner repository is private: do not add
-an unauthenticated cross-repository CI fetch. During a coordinated update, use
-an authenticated owner checkout at the recorded commit and run its
-`tools/shared_adapters.py --consumer /path/to/this/charm` to compare both adapters
-with immutable Git objects and reviewed owner source. Update the manifest only
-with the reviewed owner change; local hash checks alone do not prove upstream
-origin. No package publication is required.
+The charm uses the public `cosl` package for compression and keeps a small private
+bounded decoder at the receiver boundary. No shared adapter checkout, source
+manifest, or coordinated owner release is required. Unit tests exercise the
+receiver and reconciliation boundaries, including source retention and capacity.
