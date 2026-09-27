@@ -256,8 +256,13 @@ class LokiVmCharm(ops.CharmBase):
 
     def _on_loki_alert_rules_changed(self, event: ops.EventBase) -> None:
         """Reconcile standard provider alert-rule changes into Loki's ruler."""
-        self._refresh_loki_provider_endpoint()
-        self._reconcile_rules()
+        # Canonical lifecycle replay supplies a relation but no app/unit context.
+        # Keep that replay global; real source events identify their application.
+        relation = getattr(event, "relation", None) if getattr(event, "app", None) else None
+        if relation is not None and relation not in self.model.relations.get("loki_push_api", []):
+            relation = None
+        self._refresh_loki_provider_endpoint(relation=relation)
+        self._reconcile_rules(publication_relation=relation)
 
     def _on_loki_push_api_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
         """Withdraw the broken relation even while Juju still exposes stale data."""
@@ -372,7 +377,12 @@ class LokiVmCharm(ops.CharmBase):
         self.unit.status = self._runtime_health_status()
         self._reconcile_rules()
 
-    def _reconcile_rules(self, *, excluded_relation_id: int | None = None) -> bool:
+    def _reconcile_rules(
+        self,
+        *,
+        excluded_relation_id: int | None = None,
+        publication_relation: ops.Relation | None = None,
+    ) -> bool:
         """Apply bounded relation rules and persist accepted state in peer app data."""
         if not self._is_leader():
             return True
@@ -380,6 +390,13 @@ class LokiVmCharm(ops.CharmBase):
         if peer is None:
             logger.warning("Cannot reconcile Loki rules until the replicas relation is available")
             return True
+        publication_relations = (
+            [publication_relation]
+            if publication_relation is not None
+            else self.model.relations.get("loki_push_api", [])
+        )
+        for relation in publication_relations:
+            relation.data[self.app]["alert_rules_encodings"] = '["lzma", "json"]'
         sources = [
             RelationRuleSource(
                 relation.id,
@@ -403,12 +420,38 @@ class LokiVmCharm(ops.CharmBase):
             return True
         client = LokiRulerApiClient("http://127.0.0.1:3100")
         reconciler = LokiRuleReconciler(client)
-        reconciler.reconcile(
+        result = reconciler.reconcile(
             sources,
             cache_value=cache_value,
             persist=lambda value: peer.data[self.app].__setitem__(RULE_CACHE_KEY, value),
         )
-        return True
+        logger.info(
+            "Rule delivery: received=%d admitted=%d rejected=%d last-accepted-groups=%d "
+            "applied-sources=%s applied-groups=%s pending=%s",
+            result.received_sources,
+            result.accepted_sources,
+            len(result.rejected_sources),
+            len(result.accepted_groups),
+            result.applied_sources if result.applied_sources is not None else "unknown",
+            result.applied_groups if result.applied_groups is not None else "unknown",
+            not result.committed,
+        )
+        rule_status_owned = isinstance(
+            self.unit.status, (ops.ActiveStatus, ops.WaitingStatus)
+        ) or (self.unit.status == ops.MaintenanceStatus("starting workload"))
+        if not result.committed and rule_status_owned:
+            self.unit.status = ops.WaitingStatus(
+                "Alert rules incomplete: "
+                f"{result.accepted_sources}/{result.received_sources} sources accepted; "
+                f"{len(result.rejected_sources)} rejected; inspect unit logs"
+            )
+        elif (
+            result.committed
+            and isinstance(self.unit.status, ops.WaitingStatus)
+            and self.unit.status.message.startswith("Alert rules incomplete:")
+        ):
+            self.unit.status = self._runtime_health_status()
+        return result.committed
 
     def _fast_reconcile_rolling_restart(self) -> None:
         """Advance rolling restart state without rewriting config."""
@@ -1039,14 +1082,14 @@ class LokiVmCharm(ops.CharmBase):
             return True
         return False
 
-    def _refresh_loki_provider_endpoint(self) -> None:
+    def _refresh_loki_provider_endpoint(self, relation: ops.Relation | None = None) -> None:
         """Publish Loki push API endpoint to relation data."""
         if self._external_url_configured() and not self._is_leader():
-            self._clear_loki_provider_endpoint()
+            self._clear_loki_provider_endpoint(relation=relation)
             return
         url = self._external_url_base()
         if url:
-            self.loki_provider.update_endpoint(url=url)
+            self.loki_provider.update_endpoint(url=url, relation=relation)
 
     def _refresh_grafana_source_endpoint(self) -> None:
         """Refresh the endpoint published on `grafana-source` relations.
@@ -1078,9 +1121,12 @@ class LokiVmCharm(ops.CharmBase):
         """Return True when this unit is the leader."""
         return self.unit.is_leader()
 
-    def _clear_loki_provider_endpoint(self) -> None:
-        """Clear the published endpoint on this unit's relation data."""
-        for relation in self.model.relations.get("loki_push_api", []):
+    def _clear_loki_provider_endpoint(self, relation: ops.Relation | None = None) -> None:
+        """Clear this unit's endpoint on the selected relation, or all sources."""
+        relations = (
+            [relation] if relation is not None else self.model.relations.get("loki_push_api", [])
+        )
+        for relation in relations:
             relation.data[self.unit].pop("endpoint", None)
 
     def _clear_grafana_source_endpoint(self) -> None:

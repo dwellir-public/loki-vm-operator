@@ -19,10 +19,7 @@ from rule_reconciler import (
     MAX_CACHE_DECODED_BYTES,
     MAX_CACHE_NODES,
     MAX_CACHE_VALUE_BYTES,
-    MAX_RECONCILE_API_OPERATIONS,
-    MAX_RECONCILE_SECONDS,
     MAX_RELATION_VALUE_BYTES,
-    MAX_SOURCE_RELATIONS,
     MAX_TOTAL_GROUPS,
     MAX_TOTAL_RULES,
     InvalidRuleCacheError,
@@ -115,11 +112,12 @@ def test_decode_cache_rejects_excessive_depth_and_nodes() -> None:
         _decode_cache(_encoded_cache(too_wide))
 
 
-def test_decode_cache_rejects_more_than_32_cached_relations() -> None:
-    relations = {str(index): [] for index in range(MAX_SOURCE_RELATIONS + 1)}
+def test_decode_cache_accepts_more_than_1024_cached_relations() -> None:
+    relations = {str(index): [] for index in range(1025)}
 
-    with pytest.raises(InvalidRuleCacheError):
-        _decode_cache(_encoded_cache(_cache_document(relations=relations)))
+    assert (
+        len(_decode_cache(_encoded_cache(_cache_document(relations=relations))).snapshots) == 1025
+    )
 
 
 def test_decode_cache_normalizes_invalid_relation_snapshot_error() -> None:
@@ -293,7 +291,7 @@ def test_parse_preserves_rule_content_and_rejects_boundary_size() -> None:
                 ]
             }
         ),
-        json.dumps({"groups": [{"name": "wide", "rules": [], "x": [0] * 10_001}]}),
+        json.dumps({"groups": [{"name": "wide", "rules": [], "x": [0] * 500_001}]}),
     ],
 )
 def test_parse_rejects_unsafe_documents(payload: str) -> None:
@@ -315,6 +313,8 @@ def test_reconcile_merges_two_sources_deterministically_and_persists_cache() -> 
         persist=lambda value: persisted.__setitem__(CACHE_KEY, value),
     )
 
+    assert result.applied_sources == 2
+    assert result.applied_groups == 3
     assert [group["name"] for group in result.accepted_groups] == ["m", "a", "z"]
     assert client.groups == result.accepted_groups
     assert persisted[CACHE_KEY]
@@ -413,8 +413,10 @@ def test_invalid_cache_fails_closed_while_accepting_current_valid_source(
     ["not-base64", "A" * MAX_CACHE_VALUE_BYTES],
     ids=["corrupt", "over-limit"],
 )
+@pytest.mark.parametrize("raw_payload", [None, "not-json"])
 def test_invalid_cache_with_malformed_source_never_applies_partial_state(
     cache_value: str,
+    raw_payload: str | None,
 ) -> None:
     """Unknown cached LKG must not be replaced by only reconstructable siblings."""
     client = FakeRulerClient()
@@ -422,7 +424,7 @@ def test_invalid_cache_with_malformed_source_never_applies_partial_state(
 
     result = LokiRuleReconciler(client).reconcile(
         [
-            RelationRuleSource(1, "not-json"),
+            RelationRuleSource(1, raw_payload),
             RelationRuleSource(2, _raw(_group("valid-sibling"))),
         ],
         cache_value=cache_value,
@@ -525,6 +527,8 @@ def test_apply_failure_keeps_prior_accepted_cache_and_rules() -> None:
         persist=persist,
     )
 
+    assert second.applied_sources is None
+    assert second.applied_groups is None
     assert second.accepted_groups == first.accepted_groups
     assert cache == accepted_cache
     assert client.groups == first.accepted_groups
@@ -555,13 +559,15 @@ def test_persist_failure_rolls_live_rules_back_to_prior_accepted_state() -> None
         persist=fail_persist,
     )
 
+    assert second.applied_sources is None
+    assert second.applied_groups is None
     assert second.accepted_groups == first.accepted_groups
     assert cache == accepted_cache
     assert client.groups == first.accepted_groups
     assert [group["name"] for group in client.calls[-1]] == ["accepted"]
 
 
-def test_only_first_32_relation_ids_are_admitted() -> None:
+def test_all_1025_rule_bearing_relation_ids_are_admitted() -> None:
     client = FakeRulerClient()
     cache = ""
 
@@ -571,11 +577,11 @@ def test_only_first_32_relation_ids_are_admitted() -> None:
 
     sources = [
         RelationRuleSource(relation_id, _raw(_group(str(relation_id))))
-        for relation_id in range(40, 0, -1)
+        for relation_id in range(1025, 0, -1)
     ]
     result = LokiRuleReconciler(client).reconcile(sources, cache_value=cache, persist=persist)
 
-    assert [group["name"] for group in result.accepted_groups] == [str(i) for i in range(1, 33)]
+    assert [group["name"] for group in result.accepted_groups] == [str(i) for i in range(1, 1026)]
 
 
 def test_cached_aggregate_can_exceed_one_relation_value() -> None:
@@ -740,312 +746,287 @@ def test_api_client_accepts_explicit_empty_namespace_mapping() -> None:
     assert [request[0] for request in session.requests] == ["GET"]
 
 
-@pytest.mark.parametrize("status", [202, 500])
-def test_api_client_streams_and_closes_write_responses(status: int) -> None:
-    group = _group("new")
-    delete = FakeResponse(status)
-    responses = [FakeResponse(200, "{}"), delete]
-    if status == 202:
-        responses.append(FakeResponse(202))
-    session = FakeSession(responses)
+class IncrementalSession:
+    """Exercise real client diffing against a mutable ruler, including failures."""
 
-    if status == 202:
-        LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([group])
-    else:
-        with pytest.raises(RuntimeError):
-            LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([group])
+    def __init__(self, groups=(), *, fail_at=None, oversized=False):
+        self.groups = {group["name"]: group for group in groups}
+        self.requests = []
+        self.responses = []
+        self.fail_at = fail_at
+        self.oversized = oversized
+        self.mutations = 0
 
-    assert all(request[2]["stream"] is True for request in session.requests)
-    assert all(response.closed for response in responses)
-    assert all(response.iterated for response in responses)
+    def request(self, method, url, **kwargs):
+        from urllib.parse import unquote
+
+        self.requests.append((method, url, kwargs))
+        if method == "GET":
+            response = FakeResponse(200, json.dumps(list(self.groups.values())))
+        else:
+            self.mutations += 1
+            if self.mutations == self.fail_at:
+                response = FakeResponse(500)
+            else:
+                if method == "POST":
+                    group = yaml.safe_load(kwargs["data"])
+                    self.groups[group["name"]] = group
+                else:
+                    assert method == "DELETE"
+                    assert "/rules/" in url
+                    assert url.count("/") >= 8  # group endpoint, never the namespace
+                    self.groups.pop(unquote(url.rsplit("/", 1)[1]), None)
+                response = FakeResponse(202)
+                if self.oversized:
+                    self.oversized = False
+                    response = FakeResponse(
+                        202, chunks=[b"x" * (LokiRulerApiClient.MAX_WRITE_RESPONSE_BYTES + 1)]
+                    )
+        self.responses.append(response)
+        return response
 
 
-def test_api_client_bounds_write_response_body() -> None:
-    oversized = FakeResponse(
-        202,
-        chunks=[b"x" * LokiRulerApiClient.MAX_WRITE_RESPONSE_BYTES, b"x"],
+def test_incremental_batches_resume_and_unchanged_groups_are_not_written():
+    from rule_reconciler import MAX_MUTATION_API_OPERATIONS, RulerApplyPendingError
+
+    desired = [_group(f"g-{i:04}") for i in range(2 * MAX_MUTATION_API_OPERATIONS + 3)]
+    session = IncrementalSession()
+    batches = 0
+    while True:
+        batches += 1
+        start = len(session.requests)
+        # A fresh client models a new hook/leader without private in-memory progress.
+        client = LokiRulerApiClient("http://localhost:9009", session=session)
+        try:
+            client.replace_namespace(desired)
+        except RulerApplyPendingError:
+            assert len(session.requests) - start == MAX_MUTATION_API_OPERATIONS + 1
+            assert batches < 4
+        else:
+            break
+    assert batches == 3
+    assert len(session.groups) == len(desired)
+    assert session.mutations == len(desired)
+    client.replace_namespace(list(reversed(desired)))
+    assert session.mutations == len(desired)
+    assert all(response.closed for response in session.responses)
+
+
+def test_incremental_updates_and_group_removal_preserve_unchanged_groups():
+    kept, removed, new = _group("keep"), _group("remove / escaped"), _group("new")
+    session = IncrementalSession([kept, removed])
+    previous = LokiRulerApiClient("http://localhost:9009", session=session).replace_namespace(
+        [kept, new]
     )
-    rollback_delete = FakeResponse(202)
-    session = FakeSession([FakeResponse(200, "{}"), oversized, rollback_delete])
+    assert previous == [kept, removed]
+    assert list(session.groups.values()) == [kept, new]
+    assert [method for method, _, _ in session.requests] == ["GET", "POST", "DELETE"]
+    assert session.requests[-1][1].endswith("/remove%20%2F%20escaped")
+    assert all(request[2]["stream"] for request in session.requests)
+    assert session.requests[1][2]["headers"]["Content-Type"] == "application/yaml"
 
+
+@pytest.mark.parametrize("fail_at", [1, 2, 3])
+def test_incremental_failure_restores_captured_state_and_retry_converges(fail_at):
+    old = [_group("old-a"), _group("old-b")]
+    new = [_group("new-a"), _group("new-b")]
+    session = IncrementalSession(old, fail_at=fail_at)
+    client = LokiRulerApiClient("http://localhost:9009", session=session)
     with pytest.raises(RulerApplyError) as raised:
-        LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace(
+        client.replace_namespace(new)
+    assert raised.value.restored
+    assert session.groups == {group["name"]: group for group in old}
+    assert len(session.requests) <= MAX_API_OPERATIONS
+    client.replace_namespace(new)
+    assert session.groups == {group["name"]: group for group in new}
+    assert all(response.closed for response in session.responses)
+
+
+def test_incremental_oversized_write_response_is_closed_and_recovered():
+    old = [_group("old")]
+    session = IncrementalSession(old, oversized=True)
+    with pytest.raises(RulerApplyError) as raised:
+        LokiRulerApiClient("http://localhost:9009", session=session).replace_namespace(
             [_group("new")]
         )
+    assert raised.value.restored
+    assert session.groups == {group["name"]: group for group in old}
+    assert all(response.closed for response in session.responses)
 
-    assert isinstance(raised.value.__cause__, InvalidRuleSnapshotError)
-    assert oversized.closed is True
-    assert rollback_delete.closed is True
+
+def test_incremental_noop_and_empty_namespace_require_no_mutation():
+    session = IncrementalSession()
+    client = LokiRulerApiClient("http://localhost:9009", session=session)
+    assert client.replace_namespace([]) == []
+    assert session.mutations == 0
+    client.replace_namespace([_group("one")])
+    assert session.mutations == 1
+    client.replace_namespace([])
+    assert session.groups == {}
+    assert session.mutations == 2
 
 
-def test_api_client_deadline_bounds_slow_write_response_and_recovers() -> None:
+@pytest.mark.parametrize("expire_at", [1, 2, 3])
+def test_incremental_deadline_recovery_restores_prior_groups(expire_at):
     clock = MutableClock()
 
-    def expire() -> None:
-        clock.now = MAX_APPLY_SECONDS + 1
+    class SlowSession(IncrementalSession):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if method != "GET" and self.mutations == expire_at:
+                clock.now = MAX_APPLY_SECONDS + 1
+            return response
 
-    late_delete = FakeResponse(202, chunks=[b"ok"], on_iter=expire)
-    rollback_delete = FakeResponse(202)
-    rollback_post = FakeResponse(202)
-    old = _group("old")
-    session = FakeSession(
-        [
-            FakeResponse(200, json.dumps([old])),
-            late_delete,
-            rollback_delete,
-            rollback_post,
-        ]
-    )
-
-    with pytest.raises(RulerApplyError) as raised:
-        LokiRulerApiClient(
-            "http://127.0.0.1:3100", session=session, clock=clock
-        ).replace_namespace([_group("new")])
-
-    assert isinstance(raised.value.__cause__, TimeoutError)
-    assert late_delete.closed is True
-    assert rollback_delete.closed is True
-    assert rollback_post.closed is True
-
-
-def test_api_client_creates_namespace_when_all_rules_endpoint_is_empty() -> None:
-    group = _group("new")
-    session = FakeSession([FakeResponse(200, "{}"), FakeResponse(202), FakeResponse(202)])
-
-    LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([group])
-
-    assert [request[0] for request in session.requests] == ["GET", "DELETE", "POST"]
-
-
-def test_api_client_replaces_namespace_and_uses_yaml_group_posts() -> None:
-    old = _group("old")
-    new = _group("new")
-    session = FakeSession(
-        [
-            FakeResponse(200, json.dumps({"juju-loki-vm": [old]})),
-            FakeResponse(202),
-            FakeResponse(202),
-        ]
-    )
-
-    previous = LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace(
-        [new]
-    )
-
-    assert previous == [old]
-    assert [request[0] for request in session.requests] == ["GET", "DELETE", "POST"]
-    assert session.requests[-1][2]["headers"] == {"Content-Type": "application/yaml"}
-    assert "name: new" in session.requests[-1][2]["data"]
-
-
-def test_api_client_rolls_back_if_candidate_post_fails() -> None:
-    old = _group("old")
-    new = _group("new")
-    session = FakeSession(
-        [
-            FakeResponse(200, json.dumps({"juju-loki-vm": [old]})),
-            FakeResponse(202),
-            FakeResponse(500),
-            FakeResponse(202),
-            FakeResponse(202),
-        ]
-    )
-
-    with pytest.raises(RuntimeError):
-        LokiRulerApiClient("http://127.0.0.1:3100", session=session).replace_namespace([new])
-
-    assert [request[0] for request in session.requests] == [
-        "GET",
-        "DELETE",
-        "POST",
-        "DELETE",
-        "POST",
-    ]
-    assert "name: old" in session.requests[-1][2]["data"]
-
-
-def test_api_client_exact_worst_case_rollback_stays_within_operation_budget() -> None:
-    current = [{"name": f"old-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
-    desired = [{"name": f"new-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
-    responses = [FakeResponse(200, json.dumps(current)), FakeResponse(202)]
-    responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS - 1))
-    responses.append(FakeResponse(500))
-    responses.append(FakeResponse(202))
-    responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS))
-    session = FakeSession(responses)
-
-    with pytest.raises(RuntimeError):
-        LokiRulerApiClient(
-            "http://127.0.0.1:3100", session=session, clock=lambda: 0.0
-        ).replace_namespace(desired)
-
-    assert len(session.requests) == MAX_API_OPERATIONS
-    assert not session.responses
-
-
-def test_api_client_total_deadline_stops_work_and_next_lifecycle_retry_is_fresh() -> None:
-    group = _group("same")
-    moments = iter([0.0, 0.0, MAX_APPLY_SECONDS + 1, MAX_APPLY_SECONDS + 1])
-    last = MAX_APPLY_SECONDS + 1
-
-    def clock() -> float:
-        nonlocal last
-        last = next(moments, last)
-        return last
-
-    session = FakeSession(
-        [
-            FakeResponse(200, json.dumps([group])),
-            FakeResponse(200, json.dumps([group])),
-        ]
-    )
-    client = LokiRulerApiClient("http://127.0.0.1:3100", session=session, clock=clock)
-
-    with pytest.raises(TimeoutError):
-        client.replace_namespace([group])
-    client.replace_namespace([group])
-
-    assert len(session.requests) == 2
-    assert all(request[2]["timeout"] <= MAX_APPLY_SECONDS for request in session.requests)
-
-
-def test_api_client_deadline_stops_after_late_write_response() -> None:
-    old = _group("old")
-    new = _group("new")
-    moments = iter([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, MAX_APPLY_SECONDS + 1])
-    last = MAX_APPLY_SECONDS + 1
-
-    def clock() -> float:
-        nonlocal last
-        last = next(moments, last)
-        return last
-
-    session = FakeSession(
-        [
-            FakeResponse(200, json.dumps([old])),
-            FakeResponse(202),
-            FakeResponse(202),
-            FakeResponse(202),
-        ]
-    )
-
-    with pytest.raises(RulerApplyError) as raised:
-        LokiRulerApiClient(
-            "http://127.0.0.1:3100", session=session, clock=clock
-        ).replace_namespace([new])
-
-    assert isinstance(raised.value.__cause__, TimeoutError)
-    assert [request[0] for request in session.requests] == [
-        "GET",
-        "DELETE",
-        "DELETE",
-        "POST",
-    ]
-
-
-@pytest.mark.parametrize("expire_after", ["delete", "post-1"])
-def test_api_client_deadline_recovery_restores_captured_namespace(expire_after: str) -> None:
     old = [_group("old-a"), _group("old-b")]
-    session = StatefulRulerSession(old, expire_after=expire_after)
-
+    session = SlowSession(old)
+    client = LokiRulerApiClient("http://localhost:3100", session=session, clock=clock)
     with pytest.raises(RulerApplyError) as raised:
-        LokiRulerApiClient(
-            "http://127.0.0.1:3100", session=session, clock=session.clock
-        ).replace_namespace([_group("new-a"), _group("new-b")])
-
+        client.replace_namespace([_group("new-a"), _group("new-b")])
     assert isinstance(raised.value.__cause__, TimeoutError)
-    assert session.groups == old
+    assert raised.value.restored
+    assert session.groups == {group["name"]: group for group in old}
+    assert all(response.closed for response in session.responses)
 
 
-@pytest.mark.parametrize("expire_after", ["delete", "post-1"])
-@pytest.mark.parametrize("cache_valid", [True, False], ids=["valid-cache", "invalid-cache"])
-def test_reconcile_deadline_recovery_restores_live_namespace(
-    expire_after: str, cache_valid: bool
-) -> None:
-    old = [_group("old-a"), _group("old-b")]
-    session = StatefulRulerSession(old, expire_after=expire_after)
-    client = LokiRulerApiClient("http://127.0.0.1:3100", session=session, clock=session.clock)
-    cache_value = (
-        _encoded_cache(_cache_document(relations={"1": old}, accepted=old))
-        if cache_valid
-        else "not-base64"
-    )
-    persisted: list[str] = []
-
-    result = LokiRuleReconciler(client).reconcile(
-        [RelationRuleSource(1, _raw(_group("new-a"), _group("new-b")))],
-        cache_value=cache_value,
-        persist=persisted.append,
-    )
-
-    assert result.committed is False
-    assert session.groups == old
-    assert persisted == []
-    expected_requests = 5 if expire_after == "delete" else 6
-    assert len(session.requests) == expected_requests
-    assert len(session.requests) <= MAX_RECONCILE_API_OPERATIONS
-    assert session.clock.now <= MAX_RECONCILE_SECONDS
+def test_backend_default_fields_do_not_restart_completed_batches():
+    desired = _group("same")
+    observed = json.loads(json.dumps(desired))
+    observed["interval"] = "0s"
+    observed["rules"][0]["for"] = "0s"
+    session = IncrementalSession([observed])
+    LokiRulerApiClient("http://localhost:9009", session=session).replace_namespace([desired])
+    assert session.mutations == 0
 
 
-@pytest.mark.parametrize("cache_valid", [True, False], ids=["valid-cache", "invalid-cache"])
-def test_reconcile_worst_case_recovery_stays_within_global_operation_bound(
-    cache_valid: bool,
-) -> None:
-    current = [{"name": f"old-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
-    desired = [{"name": f"new-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
-    responses = [FakeResponse(200, json.dumps(current)), FakeResponse(202)]
-    responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS - 1))
-    responses.append(FakeResponse(500))
-    responses.append(FakeResponse(202))
-    responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS))
-    session = FakeSession(responses)
-    client = LokiRulerApiClient("http://127.0.0.1:3100", session=session, clock=lambda: 0.0)
-    cache_value = (
-        _encoded_cache(_cache_document(relations={"1": current}, accepted=current))
-        if cache_valid
-        else "not-base64"
-    )
-
-    result = LokiRuleReconciler(client).reconcile(
-        [RelationRuleSource(1, _raw(*desired))],
-        cache_value=cache_value,
-        persist=lambda _value: None,
-    )
-
-    assert result.committed is False
-    assert len(session.requests) == MAX_API_OPERATIONS
-    assert len(session.requests) <= MAX_RECONCILE_API_OPERATIONS
+def test_equivalent_nonzero_durations_do_not_reapply_groups():
+    desired = _group("same")
+    desired["interval"] = "1m"
+    desired["rules"][0]["for"] = "1h"
+    observed = json.loads(json.dumps(desired))
+    observed["interval"] = "1m0s"
+    observed["rules"][0]["for"] = "60m"
+    session = IncrementalSession([observed])
+    LokiRulerApiClient("http://localhost:9009", session=session).replace_namespace([desired])
+    assert session.mutations == 0
 
 
-def test_reconcile_worst_case_failed_recovery_and_replay_hits_global_bound() -> None:
-    old = [{"name": f"old-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
-    new = [{"name": f"new-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
-    drift = [{"name": f"drift-{index:04d}", "rules": []} for index in range(MAX_TOTAL_GROUPS)]
+def test_time_bounded_batch_keeps_progress_and_resumes_without_rollback():
+    from rule_reconciler import MAX_APPLY_SECONDS, RulerApplyPendingError
 
-    def failed_candidate_and_recovery(
-        current: list[dict[str, Any]], *, recovery_status: int
-    ) -> list[FakeResponse]:
-        responses = [FakeResponse(200, json.dumps(current)), FakeResponse(202)]
-        responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS - 1))
-        responses.append(FakeResponse(500))
-        responses.append(FakeResponse(202))
-        responses.extend(FakeResponse(202) for _ in range(MAX_TOTAL_GROUPS - 1))
-        responses.append(FakeResponse(recovery_status))
-        return responses
+    now = [0.0]
 
-    responses = failed_candidate_and_recovery(old, recovery_status=500)
-    responses.extend(failed_candidate_and_recovery(drift, recovery_status=202))
-    session = FakeSession(responses)
-    cache = _encoded_cache(_cache_document(relations={"1": old}, accepted=old))
+    class SlowSession(IncrementalSession):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if method != "GET":
+                now[0] += MAX_APPLY_SECONDS - 0.5
+            return response
 
-    result = LokiRuleReconciler(
-        LokiRulerApiClient("http://127.0.0.1:3100", session=session, clock=lambda: 0.0)
-    ).reconcile(
-        [RelationRuleSource(1, _raw(*new))],
-        cache_value=cache,
-        persist=lambda _value: None,
-    )
+    session = SlowSession()
+    desired = [_group("first"), _group("second")]
+    client = LokiRulerApiClient("http://localhost:9009", session=session, clock=lambda: now[0])
+    with pytest.raises(RulerApplyPendingError):
+        client.replace_namespace(desired)
+    assert session.mutations == 1
+    assert set(session.groups) == {"first"}
+    client.replace_namespace(desired)
+    assert session.mutations == 2
+    assert set(session.groups) == {"first", "second"}
 
-    assert result.committed is False
-    assert len(session.requests) == MAX_RECONCILE_API_OPERATIONS
-    assert not session.responses
+
+def test_resume_reads_two_generations_while_desired_capacity_stays_bounded(monkeypatch):
+    monkeypatch.setattr("rule_reconciler.MAX_TOTAL_GROUPS", 2)
+    monkeypatch.setattr("rule_reconciler.MAX_TOTAL_RULES", 2)
+    desired = [_group("new-a"), _group("new-b")]
+    session = IncrementalSession([_group("old-a"), _group("old-b"), *desired])
+    client = LokiRulerApiClient("http://localhost:9009", session=session)
+    client.replace_namespace(desired)
+    assert set(session.groups) == {"new-a", "new-b"}
+    assert session.mutations == 2
+    with pytest.raises(InvalidRuleSnapshotError):
+        client.replace_namespace([*desired, _group("too-many")])
+
+
+@pytest.mark.parametrize("accelerated", [True, False])
+@pytest.mark.parametrize("shape", ["namespace", "groups", "list"])
+def test_safe_yaml_implementations_preserve_response_shapes(monkeypatch, accelerated, shape):
+    if not accelerated:
+        monkeypatch.delattr(yaml, "CSafeLoader", raising=False)
+        monkeypatch.delattr(yaml, "CSafeDumper", raising=False)
+    expected_loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    original_load = yaml.load
+    loaders = []
+
+    def load(document, **kwargs):
+        loaders.append(kwargs["Loader"])
+        return original_load(document, **kwargs)
+
+    monkeypatch.setattr(yaml, "load", load)
+    groups = [_group("example")]
+    document = {
+        "namespace": {LokiRulerApiClient.NAMESPACE: groups},
+        "groups": {"groups": groups},
+        "list": groups,
+    }[shape]
+    for body in (json.dumps(document), yaml.safe_dump(document)):
+        response = FakeResponse(200, body)
+        session = FakeSession([response])
+        assert (
+            LokiRulerApiClient("http://fixture", session=session).replace_namespace(groups)
+            == groups
+        )
+        assert response.closed
+        assert len(session.requests) == 1
+    assert loaders == [expected_loader, expected_loader]
+
+
+@pytest.mark.parametrize("accelerated", [True, False])
+@pytest.mark.parametrize("kind", ["unsafe_tag", "recursive_alias", "depth", "nodes"])
+def test_safe_yaml_implementations_reject_unsafe_bounded_responses(monkeypatch, accelerated, kind):
+    import rule_reconciler as module
+
+    if not accelerated:
+        monkeypatch.delattr(yaml, "CSafeLoader", raising=False)
+    payloads = {
+        "unsafe_tag": "!!python/object/apply:os.system ['false']",
+        "recursive_alias": (
+            f"{LokiRulerApiClient.NAMESPACE}: [{{name: bad, rules: [], extra: &a [*a]}}]"
+        ),
+        "depth": f"{LokiRulerApiClient.NAMESPACE}: [{{name: deep, rules: [], extra: "
+        + "[" * 40
+        + "0"
+        + "]" * 40
+        + "}]",
+        "nodes": json.dumps(
+            {LokiRulerApiClient.NAMESPACE: [dict(_group("wide"), extra=[0] * 100)]}
+        ),
+    }
+    if kind == "nodes":
+        monkeypatch.setattr(module, "MAX_CACHE_NODES", 64)
+    response = FakeResponse(200, payloads[kind])
+    session = FakeSession([response])
+    with pytest.raises(InvalidRuleSnapshotError):
+        LokiRulerApiClient("http://fixture", session=session).replace_namespace([])
+    assert response.closed
+    assert [request[0] for request in session.requests] == ["GET"]
+
+
+@pytest.mark.parametrize("accelerated", [True, False])
+def test_safe_yaml_dump_preserves_group_content(monkeypatch, accelerated):
+    if not accelerated:
+        monkeypatch.delattr(yaml, "CSafeDumper", raising=False)
+    expected_dumper = getattr(yaml, "CSafeDumper", yaml.SafeDumper)
+    original_dump = yaml.dump
+    dumpers = []
+
+    def dump(document, **kwargs):
+        dumpers.append(kwargs["Dumper"])
+        return original_dump(document, **kwargs)
+
+    monkeypatch.setattr(yaml, "dump", dump)
+    group = _group("quoted", 'sum(rate(errors_total{job="demo"}[5m])) > 0')
+    group["rules"][0]["annotations"] = {"summary": "yes: unicode å\nsecond line"}
+    session = FakeSession([FakeResponse(200, "[]"), FakeResponse(202)])
+    assert LokiRulerApiClient("http://fixture", session=session).replace_namespace([group]) == []
+    assert yaml.safe_load(session.requests[1][2]["data"]) == group
+    assert dumpers == [expected_dumper]

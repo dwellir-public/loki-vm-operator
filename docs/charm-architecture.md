@@ -74,8 +74,8 @@ default path so upstream Loki expectations still hold. Generated config is writt
 
 `src/rule_reconciler.py` validates relation JSON, enforces the sub-60-KiB value limit and bounded
 tree/work limits, and deterministically merges groups by relation ID and group name. It preserves
-expressions, names, and labels. At most 32 source relations are admitted, and explicit aggregate
-group/rule, HTTP-operation, response-stream, and per-request connect/read-inactivity limits bound
+expressions, names, and labels. Source admission uses an aggregate decoded-byte budget without a
+source-count cutoff. Explicit aggregate group/rule, HTTP-operation, response-stream, and per-request connect/read-inactivity limits bound
 ruler work. The leader owns the single `juju-loki-vm` namespace through Loki's supported ruler
 HTTP API; unchanged state is not rewritten, while updates and removals use group YAML requests. Mutation responses
 are streamed, bounded, and closed. A failed or expired candidate write restores

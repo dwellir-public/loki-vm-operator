@@ -1,0 +1,42 @@
+name: Dependency provenance and artifact BOMs
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  provenance:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            base: ubuntu@24.04
+            platform: amd64
+            artifact: loki-vm_amd64.charm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Verify locked and vendored dependencies
+        run: |
+          uv sync --locked --group dev
+          python3 tools/dependency_bom.py --verify-upstream
+          uv run tox -e provenance
+          python3 tools/dependency_bom.py --output build/development.cdx.json
+      - name: Build charm and verify actual packed inventory
+        run: |
+          sudo snap install charmcraft --classic
+          sudo charmcraft pack --destructive-mode --platform '${{ matrix.platform }}'
+          python3 tools/dependency_bom.py --artifact '${{ matrix.artifact }}' --base '${{ matrix.base }}' --arch amd64 --output build/runtime.cdx.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: charm-and-boms-${{ matrix.base }}
+          path: |
+            *.charm
+            build/*.cdx.json

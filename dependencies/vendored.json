@@ -1,0 +1,44 @@
+[
+  {
+    "path": "lib/charms/grafana_k8s/v0/grafana_source.py",
+    "sha256": "2c8d1b72f9c2e5b99a143ab4a62b9acb004d50375598cb2c2d7b9570383863a8",
+    "library": {
+      "LIBID": "974705adb86f40228298156e34b460dc",
+      "LIBAPI": 0,
+      "LIBPATCH": 29
+    },
+    "scope": "runtime",
+    "upstream_path": "lib/charms/grafana_k8s/v0/grafana_source.py",
+    "repository": "https://github.com/canonical/grafana-k8s-operator",
+    "commit": "782114043bd8f13e7eb82a3bfaae29477274674f",
+    "license": "Apache-2.0"
+  },
+  {
+    "path": "lib/charms/loki_k8s/v1/loki_push_api.py",
+    "sha256": "8b148c535578c8b697ed58bea65a8c53eea488bc2dea019e5e46f94cfb72a14e",
+    "library": {
+      "LIBID": "bf76f23cdd03464b877c52bd1d2f563e",
+      "LIBAPI": 1,
+      "LIBPATCH": 22
+    },
+    "scope": "runtime",
+    "upstream_path": "lib/charms/loki_k8s/v1/loki_push_api.py",
+    "repository": "https://github.com/canonical/loki-k8s-operator",
+    "commit": "1b0095dab63ff961d137de101db25c008259595a",
+    "license": "Apache-2.0"
+  },
+  {
+    "path": "lib/charms/traefik_k8s/v1/ingress_per_unit.py",
+    "sha256": "61ed6416d7f0ee016e8c552d655fd654b39c12a16122b2a88a969c06f82e7bbf",
+    "library": {
+      "LIBID": "7ef06111da2945ed84f4f5d4eb5b353a",
+      "LIBAPI": 1,
+      "LIBPATCH": 22
+    },
+    "scope": "runtime",
+    "upstream_path": "lib/charms/traefik_k8s/v1/ingress_per_unit.py",
+    "repository": "https://github.com/canonical/traefik-k8s-operator",
+    "commit": "f7754a3cf56179f6c7756b5ebe242fc616cfa05f",
+    "license": "Apache-2.0"
+  }
+]

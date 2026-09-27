@@ -21,6 +21,12 @@ parts:
     build-snaps:
       - astral-uv
 
+  templates:
+    plugin: dump
+    source: .
+    prime:
+      - "./templates/*"
+
 storage:
   loki-persisted:
     type: filesystem
