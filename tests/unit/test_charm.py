@@ -24,6 +24,7 @@ META = {
     "requires": {
         "ingress": {"interface": "ingress_per_unit"},
         "s3": {"interface": "s3", "limit": 1},
+        "alertmanager": {"interface": "alertmanager_dispatch", "limit": 1},
     },
     "peers": {"replicas": {"interface": "loki_replica"}},
     "storage": {"loki-persisted": {"type": "filesystem"}},

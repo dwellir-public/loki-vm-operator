@@ -40,5 +40,19 @@
     "repository": "https://github.com/canonical/traefik-k8s-operator",
     "commit": "f7754a3cf56179f6c7756b5ebe242fc616cfa05f",
     "license": "Apache-2.0"
+  },
+  {
+    "path": "lib/charms/alertmanager_k8s/v1/alertmanager_dispatch.py",
+    "sha256": "82d0de7b4350d795c6ea6619ee219678b692339d1e65968e97433748bb132443",
+    "library": {
+      "LIBID": "37f1ca6f8fe84e3092ebbf6dc2885310",
+      "LIBAPI": 1,
+      "LIBPATCH": 2
+    },
+    "scope": "runtime",
+    "upstream_path": "lib/charms/alertmanager_k8s/v1/alertmanager_dispatch.py",
+    "repository": "https://github.com/canonical/alertmanager-k8s-operator",
+    "commit": "0ffba9a3dff6a03134c994c493e45888681d9a94",
+    "license": "Apache-2.0"
   }
 ]

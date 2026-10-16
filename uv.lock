@@ -369,6 +369,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "object-storage-charmlib" },
     { name = "ops" },
+    { name = "pydantic" },
     { name = "pyyaml" },
     { name = "requests" },
 ]
@@ -406,6 +407,7 @@ requires-dist = [
     { name = "jsonschema" },
     { name = "object-storage-charmlib" },
     { name = "ops", specifier = ">=3,<4" },
+    { name = "pydantic", specifier = ">=2,<3" },
     { name = "pyyaml" },
     { name = "requests" },
 ]

@@ -22,5 +22,11 @@
     "role": "runtime-vendored",
     "source_path": "lib/charms/traefik_k8s/v1/ingress_per_unit.py",
     "distribution": null
+  },
+  "alertmanager_dispatch": {
+    "repository": "https://github.com/canonical/alertmanager-k8s-operator",
+    "role": "runtime-vendored",
+    "source_path": "lib/charms/alertmanager_k8s/v1/alertmanager_dispatch.py",
+    "distribution": null
   }
 }
