@@ -15,7 +15,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import ops
+import pydantic
 import yaml
+from charms.alertmanager_k8s.v1.alertmanager_dispatch import (
+    AlertmanagerConsumer,
+    _ProviderSchemaV0,  # pyright: ignore[reportPrivateUsage]
+    _ProviderSchemaV1,  # pyright: ignore[reportPrivateUsage]
+)
 from charms.grafana_k8s.v0.grafana_source import GrafanaSourceData, GrafanaSourceProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
 from charms.traefik_k8s.v1.ingress_per_unit import IngressPerUnitRequirer
@@ -127,6 +133,14 @@ class LokiVmCharm(ops.CharmBase):
             requirer_endpoint=None,
         )
         self.s3_client = S3Requirer(self, relation_name="s3")
+        self.alertmanager_consumer = AlertmanagerConsumer(self, relation_name="alertmanager")
+        framework.observe(
+            self.alertmanager_consumer.on.cluster_changed,  # pyright: ignore
+            self._on_alertmanager_changed,
+        )
+        framework.observe(self.on.alertmanager_relation_created, self._on_alertmanager_changed)
+        framework.observe(self.on.alertmanager_relation_joined, self._on_alertmanager_changed)
+        framework.observe(self.on.alertmanager_relation_broken, self._on_alertmanager_changed)
         framework.observe(self.on.install, self._on_install)
         framework.observe(self.on.start, self._on_start)
         framework.observe(self.on.config_changed, self._on_config_changed)
@@ -299,6 +313,10 @@ class LokiVmCharm(ops.CharmBase):
     def _on_s3_changed(self, event: ops.EventBase) -> None:
         """Handle S3 relation changes and reconfigure storage."""
         self._reconcile_runtime(status_message="updating storage configuration")
+
+    def _on_alertmanager_changed(self, event: ops.EventBase) -> None:
+        """Handle Alertmanager relation changes and re-render the ruler notification target."""
+        self._reconcile_runtime(status_message="updating alertmanager configuration")
 
     def _on_cluster_health_action(self, event: ops.ActionEvent) -> None:
         """Report compact cluster health plus detailed member readiness."""
@@ -554,6 +572,11 @@ class LokiVmCharm(ops.CharmBase):
                 logger.warning(
                     "config-override does not enable relation alert-rule reconciliation"
                 )
+            if self._alertmanager_url():
+                logger.warning(
+                    "config-override is set; the alertmanager relation URL is not rendered. "
+                    "Set ruler.alertmanager_url in the override to deliver notifications."
+                )
             return override
         source_data = self._sorted_source_data()
         builder = ConfigBuilder(
@@ -568,9 +591,62 @@ class LokiVmCharm(ops.CharmBase):
             memberlist_join_members=self._memberlist_join_members(),
             s3=self._storage_backend_state().s3,
             loki_version=loki.get_version(),
+            alertmanager_url=self._alertmanager_url(),
         )
         rendered = yaml.safe_dump(builder.build(), sort_keys=False)
         return f"{loki.GENERATED_CONFIG_HEADER}{rendered}"
+
+    def _alertmanager_url(self) -> str | None:
+        """Return the comma-joined Alertmanager URLs for `ruler.alertmanager_url`, or None.
+
+        Loki treats each comma-separated URL as a separate Alertmanager group, so every
+        related unit receives every notification.
+        """
+        urls = self._alertmanager_urls()
+        return ",".join(urls) if urls else None
+
+    def _alertmanager_urls(self) -> list[str]:
+        """Return every URL published by related Alertmanager units, sorted.
+
+        During `alertmanager-relation-broken` ops already excludes the departing relation
+        from the model, so the rendered config drops its URLs in the same hook. During
+        `alertmanager-relation-departed` the vendored consumer can raise `KeyError` for the
+        departing unit; that case goes through the fallback, which skips the departing unit.
+        """
+        try:
+            return sorted(self.alertmanager_consumer.get_cluster_info())
+        except KeyError:
+            return self._alertmanager_urls_skipping_gone_units()
+
+    def _alertmanager_urls_skipping_gone_units(self) -> list[str]:
+        """Parse Alertmanager unit data exactly like the vendored consumer, skipping gone units.
+
+        The vendored library must stay byte-identical to upstream for provenance checks, so
+        the departing-unit tolerance lives here and mirrors its v1-then-v0 parsing.
+        """
+        relation = self.model.get_relation("alertmanager")
+        if relation is None:
+            return []
+        urls: set[str] = set()
+        for unit in relation.units:
+            try:
+                rel_data = relation.data[unit]
+            except KeyError:
+                logger.debug("Skipping Alertmanager unit %s with no relation data", unit.name)
+                continue
+            if not rel_data:
+                continue
+            try:  # v1
+                urls.add(_ProviderSchemaV1(**rel_data).url)
+            except pydantic.ValidationError as ev1:
+                try:  # v0
+                    data = _ProviderSchemaV0(**rel_data)
+                except pydantic.ValidationError as ev0:
+                    logger.warning("Relation data failed validation for v1: %s", ev1)
+                    logger.warning("Relation data failed validation for v0: %s", ev0)
+                else:
+                    urls.add(f"{data.scheme}://{data.public_address}")
+        return sorted(urls)
 
     @staticmethod
     def _override_has_ruler_contract(override: str) -> bool:

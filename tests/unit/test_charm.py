@@ -4,10 +4,12 @@
 # To learn more about testing, see https://documentation.ubuntu.com/ops/latest/explanation/testing/
 
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
 import yaml
+from charms.alertmanager_k8s.v1.alertmanager_dispatch import AlertmanagerConsumer
 from ops import testing
 
 from charm import InvalidConfigurationError, LokiVmCharm, StorageBackendState
@@ -79,6 +81,46 @@ def _s3_relation(
             "path": path,
         },
     )
+
+
+def _alertmanager_relation(
+    *, remote_units_data: dict[int, dict[str, str]] | None = None, relation_id: int = 42
+) -> testing.Relation:
+    return testing.Relation(
+        "alertmanager",
+        interface="alertmanager_dispatch",
+        id=relation_id,
+        remote_app_name="alertmanager-vm",
+        remote_units_data=(
+            remote_units_data
+            if remote_units_data is not None
+            else {0: {"url": "http://10.0.0.7:9093"}}
+        ),
+    )
+
+
+def _mock_running_loki(monkeypatch: pytest.MonkeyPatch, seen: dict) -> None:
+    """Make a single-unit Loki look installed and running; capture writes and restarts."""
+    on_disk: dict[str, str | None] = {"config": None}
+
+    def mock_write_config_text(config_text: str, **_):
+        seen["config"] = config_text
+        on_disk["config"] = config_text
+
+    monkeypatch.setattr("charm.loki.is_active", lambda **_: True)
+    monkeypatch.setattr("charm.loki.get_version", mock_get_version)
+    monkeypatch.setattr("charm.loki.verify_config", lambda **_: None)
+    monkeypatch.setattr("charm.loki.write_config_text", mock_write_config_text)
+    monkeypatch.setattr(
+        "charm.loki.restart", lambda: seen.setdefault("calls", []).append("restart")
+    )
+    monkeypatch.setattr("charm.LokiVmCharm._read_config_from_disk", lambda self: on_disk["config"])
+    monkeypatch.setattr("charm.LokiVmCharm._wait_for_local_ready", lambda *_, **__: None)
+
+
+def _rendered_yaml(seen: dict) -> dict:
+    text = "\n".join(line for line in seen["config"].splitlines() if not line.startswith("#"))
+    return yaml.safe_load(text)
 
 
 def _rule_relation(name: str = "source", relation_id: int = 7) -> testing.Relation:
@@ -1603,3 +1645,130 @@ def test_removed_source_event_only_publishes_to_remaining_inventory(monkeypatch)
         assert relation is not None
         assert relation.data[manager.charm.unit]["endpoint"]
         assert relation.data[manager.charm.app]["alert_rules_encodings"]
+
+
+def test_alertmanager_relation_renders_sorted_url_and_restarts(monkeypatch: pytest.MonkeyPatch):
+    ctx = _context()
+    seen: dict = {}
+    _mock_running_loki(monkeypatch, seen)
+    relation = _alertmanager_relation(
+        remote_units_data={0: {"url": "http://10.0.0.7:9093"}, 1: {"url": "http://10.0.0.5:9093"}}
+    )
+
+    ctx.run(ctx.on.relation_changed(relation, remote_unit=1), testing.State(relations=[relation]))
+
+    ruler = _rendered_yaml(seen)["ruler"]
+    assert ruler["alertmanager_url"] == "http://10.0.0.5:9093,http://10.0.0.7:9093"
+    assert ruler["enable_alertmanager_v2"] is True
+    assert seen["calls"] == ["restart"]
+
+
+def test_alertmanager_unit_without_url_is_ignored_and_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ctx = _context()
+    seen: dict = {}
+    _mock_running_loki(monkeypatch, seen)
+    relation = _alertmanager_relation(remote_units_data={0: {}})
+
+    # Baseline render (first write always restarts), then the joined hook must be a no-op.
+    state = ctx.run(ctx.on.config_changed(), testing.State(relations=[relation]))
+    seen["calls"] = []
+    ctx.run(ctx.on.relation_joined(relation, remote_unit=0), state)
+
+    assert "alertmanager_url" not in _rendered_yaml(seen)["ruler"]
+    assert seen["calls"] == []
+
+
+def test_alertmanager_relation_broken_drops_url_and_restarts(monkeypatch: pytest.MonkeyPatch):
+    ctx = _context()
+    seen: dict = {}
+    _mock_running_loki(monkeypatch, seen)
+    relation = _alertmanager_relation()
+
+    state = ctx.run(
+        ctx.on.relation_changed(relation, remote_unit=0), testing.State(relations=[relation])
+    )
+    assert "alertmanager_url" in _rendered_yaml(seen)["ruler"]
+    seen["calls"] = []
+    ctx.run(ctx.on.relation_broken(relation), state)
+
+    assert "alertmanager_url" not in _rendered_yaml(seen)["ruler"]
+    assert seen["calls"] == ["restart"]
+
+
+def _raise_key_error(self) -> set[str]:
+    raise KeyError("departing unit")
+
+
+def test_alertmanager_urls_fall_back_when_consumer_raises_key_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ctx = _context()
+    seen: dict = {}
+    _mock_running_loki(monkeypatch, seen)
+    monkeypatch.setattr(AlertmanagerConsumer, "get_cluster_info", _raise_key_error)
+    relation = _alertmanager_relation(
+        remote_units_data={
+            0: {"url": "http://10.0.0.5:9093"},
+            1: {"public_address": "10.0.0.6:9093", "scheme": "http"},
+        }
+    )
+
+    ctx.run(ctx.on.config_changed(), testing.State(relations=[relation]))
+
+    assert _rendered_yaml(seen)["ruler"]["alertmanager_url"] == (
+        "http://10.0.0.5:9093,http://10.0.0.6:9093"
+    )
+
+
+def test_alertmanager_relation_departed_keeps_remaining_unit_url(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ctx = _context()
+    seen: dict = {}
+    _mock_running_loki(monkeypatch, seen)
+    relation = _alertmanager_relation(remote_units_data={0: {"url": "http://10.0.0.7:9093"}})
+
+    # Unit 1 departs with no databag left; without the fallback the hook raises KeyError.
+    ctx.run(ctx.on.relation_departed(relation, remote_unit=1), testing.State(relations=[relation]))
+
+    assert _rendered_yaml(seen)["ruler"]["alertmanager_url"] == "http://10.0.0.7:9093"
+
+
+def test_config_override_ignores_alertmanager_relation_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    ctx = _context()
+    seen: dict = {}
+    _mock_running_loki(monkeypatch, seen)
+    override = "auth_enabled: false\nserver:\n  http_listen_port: 3100\n"
+    relation = _alertmanager_relation()
+
+    with caplog.at_level(logging.WARNING, logger="charm"):
+        ctx.run(
+            ctx.on.relation_changed(relation, remote_unit=0),
+            testing.State(config={"config-override": override}, relations=[relation]),
+        )
+
+    assert seen["config"] == override.strip()
+    assert "alertmanager" in caplog.text and "config-override" in caplog.text
+
+
+def test_alertmanager_relation_is_not_a_rule_source(monkeypatch: pytest.MonkeyPatch):
+    ctx = _context()
+    seen: dict = {}
+    _mock_running_loki(monkeypatch, seen)
+    _FakeRulerApi.calls = []
+    monkeypatch.setattr("charm.LokiRulerApiClient", _FakeRulerApi)
+    peer = testing.PeerRelation("replicas", interface="loki_replica", id=99)
+    relation = _alertmanager_relation(
+        remote_units_data={0: {"url": "http://10.0.0.7:9093", "alert_rules": '{"groups":[]}'}}
+    )
+
+    ctx.run(
+        ctx.on.relation_changed(relation, remote_unit=0),
+        testing.State(leader=True, relations=[relation, peer]),
+    )
+
+    assert all(groups == [] for groups in _FakeRulerApi.calls)
