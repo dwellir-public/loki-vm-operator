@@ -78,6 +78,12 @@ Alternatively, set `CHARM_PATH` to an existing `.charm` file:
 CHARM_PATH=/path/to/loki-vm_ubuntu-24.04-amd64.charm uv run pytest tests/integration
 ```
 
+The integration fixture defaults to the `localhost-localhost` controller and `localhost` cloud, and
+requires that controller's `admin/controller` model to be the active Juju context. Set
+`JUJU_INTEGRATION_CONTROLLER` and `JUJU_INTEGRATION_CLOUD` to use a differently named LXD controller
+or cloud (for example `JUJU_INTEGRATION_CONTROLLER=local`). The Alertmanager relation test also needs
+`ALERTMANAGER_CHARM_PATH` (a packed `alertmanager-vm` charm).
+
 Note: Rebuild the charm (`charmcraft pack`) after code changes so integration tests
 use the latest artifact.
 

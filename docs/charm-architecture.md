@@ -62,6 +62,9 @@ becomes a waiting status if a producer supplies rules.
 - `replicas`: shares peer addresses for memberlist-based clustered Loki operation.
 - `s3`: provides object storage credentials required for clustered Loki and optional for single-unit
   S3-backed deployments.
+- `alertmanager`: consumes `alertmanager_dispatch` unit URLs and renders them, sorted and
+  comma-joined, into `ruler.alertmanager_url`; changes go through the normal config
+  reconcile and restart path. Ignored while `config-override` is set.
 
 ## Storage and Data Paths
 
