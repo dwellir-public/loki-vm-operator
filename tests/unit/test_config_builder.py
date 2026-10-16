@@ -144,3 +144,37 @@ def test_config_builder_s3_storage_mode():
         },
     }
     assert config["compactor"]["delete_request_store"] == "s3"
+
+
+def _builder(**overrides) -> ConfigBuilder:
+    kwargs = {
+        "instance_addr": "10.0.0.1",
+        "ingestion_rate_mb": 4,
+        "ingestion_burst_size_mb": 15,
+        "retention_period": 14,
+        "reporting_enabled": True,
+        "data_dir": "/var/lib/loki",
+        "loki_version": "3.4.0",
+    }
+    kwargs.update(overrides)
+    return ConfigBuilder(**kwargs)
+
+
+def test_ruler_without_alertmanager_has_no_notification_keys() -> None:
+    ruler = _builder().build()["ruler"]
+    assert ruler == {"enable_api": True, "rule_path": "/var/lib/loki/ruler-tmp"}
+
+
+def test_ruler_with_alertmanager_url_enables_v2_delivery() -> None:
+    ruler = _builder(alertmanager_url="http://10.0.0.5:9093,http://[fd00::7]:9093").build()[
+        "ruler"
+    ]
+    assert ruler["alertmanager_url"] == "http://10.0.0.5:9093,http://[fd00::7]:9093"
+    assert ruler["enable_alertmanager_v2"] is True
+    assert ruler["enable_api"] is True
+
+
+def test_ruler_with_empty_alertmanager_url_renders_nothing() -> None:
+    ruler = _builder(alertmanager_url="").build()["ruler"]
+    assert "alertmanager_url" not in ruler
+    assert "enable_alertmanager_v2" not in ruler
