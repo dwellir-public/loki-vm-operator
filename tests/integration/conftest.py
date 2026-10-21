@@ -20,6 +20,9 @@ jubilant = pytest.importorskip("jubilant")
 
 logger = logging.getLogger(__name__)
 
+INTEGRATION_CONTROLLER = os.environ.get("JUJU_INTEGRATION_CONTROLLER", "localhost-localhost")
+INTEGRATION_CLOUD = os.environ.get("JUJU_INTEGRATION_CLOUD", "localhost")
+
 
 @pytest.fixture(scope="module")
 def juju(request: pytest.FixtureRequest):
@@ -30,11 +33,10 @@ def juju(request: pytest.FixtureRequest):
         capture_output=True,
         text=True,
     ).stdout.strip()
-    if active_context != "localhost-localhost:admin/controller":
-        raise pytest.UsageError(
-            "Integration tests require active context localhost-localhost:admin/controller"
-        )
-    with jubilant.temp_model(controller="localhost-localhost", cloud="localhost") as juju:
+    expected_context = f"{INTEGRATION_CONTROLLER}:admin/controller"
+    if active_context != expected_context:
+        raise pytest.UsageError(f"Integration tests require active context {expected_context}")
+    with jubilant.temp_model(controller=INTEGRATION_CONTROLLER, cloud=INTEGRATION_CLOUD) as juju:
         controller = _current_controller(juju)
         logger.info("Using temp model: %s (controller: %s)", juju.model, controller)
         print(f"Using temp model: {juju.model} (controller: {controller})")
@@ -62,6 +64,18 @@ def rule_provider_charm() -> pathlib.Path:
     if len(paths) != 1:
         raise RuntimeError("Expected exactly one built rule-provider charm")
     return paths[0]
+
+
+@pytest.fixture(scope="session")
+def alertmanager_charm() -> pathlib.Path:
+    """Return the prebuilt alertmanager-vm charm for the Alertmanager relation test."""
+    configured = os.environ.get("ALERTMANAGER_CHARM_PATH")
+    if not configured:
+        pytest.skip("Set ALERTMANAGER_CHARM_PATH to run the Alertmanager relation test")
+    path = pathlib.Path(configured)
+    if not path.exists():
+        raise FileNotFoundError(f"Alertmanager charm does not exist: {path}")
+    return path
 
 
 @pytest.fixture(scope="session")

@@ -63,6 +63,13 @@ requires:
     description: |
       Consume S3 credentials and endpoint information from an S3 provider charm for
       Loki TSDB object storage.
+  alertmanager:
+    interface: alertmanager_dispatch
+    optional: true
+    limit: 1
+    description: |
+      Send ruler alert notifications to related Alertmanager units
+      (for example alertmanager-vm). Rendered as `ruler.alertmanager_url`.
 
 peers:
   replicas:

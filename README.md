@@ -63,6 +63,7 @@ Supported relations:
 - `ingress` (ingress_per_unit)
 - `s3` (requires) for upstream S3 provider contracts
 - `loki_push_api` (provides Loki push endpoint)
+- `alertmanager` (requires, `alertmanager_dispatch`) for ruler notifications to `alertmanager-vm`
 
 ### Alert rules on `loki_push_api`
 
@@ -136,6 +137,22 @@ Inspect loaded alert rules directly:
 ```bash
 juju exec --unit loki-vm/0 -- \
   curl -fsS 'http://127.0.0.1:3100/prometheus/api/v1/rules?type=alert'
+```
+
+### Alertmanager notifications
+
+Relate `loki-vm:alertmanager` to `alertmanager-vm:alerting` to deliver evaluated relation
+rules as notifications. The charm renders every related Alertmanager unit URL, sorted and
+comma-joined, into `ruler.alertmanager_url` with `enable_alertmanager_v2: true`; Loki treats
+each URL as its own Alertmanager group. The endpoint accepts one Alertmanager application
+(`limit: 1`) because the upstream consumer library cannot address two applications on one
+endpoint; several units of that application are fine. Adding, removing or re-addressing a
+unit changes the generated config and restarts Loki (rolling restart in clustered mode).
+When `config-override` is set the override is used verbatim: the relation URL is not injected
+and a warning is logged, so set `ruler.alertmanager_url` in the override yourself.
+
+```
+juju integrate loki-vm:alertmanager alertmanager-vm:alerting
 ```
 
 ### S3 migration integration inputs
@@ -534,7 +551,7 @@ cannot fit an aggregate retains the previous accepted publication and reports
 pending delivery. New readers accept previous cache formats; older 32-source
 builds cannot read all new cache states or accept the larger volume. Roll back
 using a compatible build; do not delete rules or downgrade blindly to make them
-fit. Notifications require separately configured Alertmanager routing.
+fit. Notifications are delivered over the `alertmanager` relation (see "Alertmanager notifications").
 
 The capacity corpus tests are distinct from live relation-scale tests. The
 coordinated reference repository's `tests/retained` suite targets dedicated local
